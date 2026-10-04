@@ -24,7 +24,7 @@ namespace WpfApp1
 {
     public partial class MainWindow
     {
-        private const string EdlFeedbackFileMarker = "=== VioletTool EDL BUG Feedback ===";
+        private const string EdlFeedbackFileMarker = "=== YuzakiTool EDL BUG Feedback ===";
         private const string EdlFeedbackUiLogMarker = "=== EDL 界面日志 ===";
         private const string EdlFeedbackNativeLogMarker = "=== EDL 底层通信日志 ===";
 
@@ -493,7 +493,7 @@ namespace WpfApp1
 
             string snapshotDirectory = Path.Combine(
                 Path.GetTempPath(),
-                "VioletTool",
+                "YuzakiTool",
                 "edl-feedback",
                 Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(snapshotDirectory);
@@ -545,7 +545,7 @@ namespace WpfApp1
             string fileName = Path.GetFileName(logPath);
             if (!System.Text.RegularExpressions.Regex.IsMatch(
                     fileName,
-                    @"^VioletToolEdlLog\d{8}_\d{6}\.txt$",
+                    @"^YuzakiToolEdlLog\d{8}_\d{6}\.txt$",
                     System.Text.RegularExpressions.RegexOptions.CultureInvariant))
             {
                 throw new InvalidOperationException("日志文件名格式不正确");
@@ -576,7 +576,7 @@ namespace WpfApp1
                     {
                         CharSet = "utf-8"
                     };
-                    content.Headers.Add("X-Violet-Log-Name", fileName);
+                    content.Headers.Add("X-Yuzaki-Log-Name", fileName);
 
                     string uploadUrl = ApplyViolettoolSignIfNeeded(candidate);
                     response = await client

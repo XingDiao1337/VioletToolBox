@@ -9,6 +9,82 @@
                 <ResourceDictionary Source="pack://application:,,,/HandyControl;component/Themes/SkinDefault.xaml"/>
                 <ResourceDictionary Source="pack://application:,,,/HandyControl;component/Themes/Theme.xaml"/>
             </ResourceDictionary.MergedDictionaries>
+
+            <!-- 原生 Win32 控件默认样式覆盖 -->
+            <Style TargetType="{x:Type Button}">
+                <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="Height" Value="26"/>
+                <Setter Property="Padding" Value="10,2"/>
+                <Setter Property="Background" Value="#E1E1E1"/>
+                <Setter Property="Foreground" Value="#000000"/>
+                <Setter Property="BorderBrush" Value="#ADADAD"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="{x:Type Button}">
+                            <Border x:Name="bd"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="2"
+                                    SnapsToDevicePixels="True">
+                                <ContentPresenter HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center"
+                                                  Margin="{TemplateBinding Padding}"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="#E5F1FB"/>
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="#0078D7"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="#CCE4F7"/>
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="#005499"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter TargetName="bd" Property="Background" Value="#F4F4F4"/>
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="#CCCCCC"/>
+                                    <Setter Property="Foreground" Value="#888888"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style TargetType="{x:Type TextBox}">
+                <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="Height" Value="26"/>
+                <Setter Property="Background" Value="#FFFFFF"/>
+                <Setter Property="Foreground" Value="#000000"/>
+                <Setter Property="BorderBrush" Value="#7A7A7A"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Padding" Value="4,2"/>
+                <Setter Property="VerticalContentAlignment" Value="Center"/>
+            </Style>
+
+            <Style TargetType="{x:Type GroupBox}">
+                <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Foreground" Value="#222222"/>
+                <Setter Property="BorderBrush" Value="#D0D0D0"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Background" Value="#FFFFFF"/>
+                <Setter Property="Padding" Value="8"/>
+            </Style>
+
+            <Style TargetType="{x:Type ComboBox}">
+                <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="Height" Value="26"/>
+            </Style>
+
+            <Style TargetType="{x:Type TextBlock}">
+                <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

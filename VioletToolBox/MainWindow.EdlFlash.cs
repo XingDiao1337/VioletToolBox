@@ -217,7 +217,7 @@ namespace WpfApp1
                 "tmp",
                 "log");
             Directory.CreateDirectory(logDir);
-            string fileName = "VioletToolEdlLog" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".txt";
+            string fileName = "YuzakiToolEdlLog" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".txt";
             string logPath = Path.Combine(logDir, fileName);
             File.WriteAllText(logPath, string.Empty, new UTF8Encoding(false));
 
@@ -257,7 +257,7 @@ namespace WpfApp1
             try
             {
                 string fileName = Path.GetFileName(path) ?? string.Empty;
-                if (fileName.StartsWith("VioletToolEdlLog", StringComparison.OrdinalIgnoreCase) &&
+                if (fileName.StartsWith("YuzakiToolEdlLog", StringComparison.OrdinalIgnoreCase) &&
                     fileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) &&
                     File.Exists(path))
                 {
@@ -1007,7 +1007,7 @@ namespace WpfApp1
 
             string cacheRoot = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "VioletTool",
+                "YuzakiTool",
                 "qc_cache");
             string safeName = Regex.Replace(option.DisplayName, @"[\\/:*?""<>|]+", "_");
             string itemDir = Path.Combine(cacheRoot, safeName);
@@ -1731,7 +1731,7 @@ namespace WpfApp1
 
             string backupDir = Path.Combine(
                 dlg.SelectedPath,
-                "Violet_gpt_backup_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture));
+                "Yuzaki_gpt_backup_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture));
             string loaderPath = EdlLoaderTextBox?.Text ?? "";
             bool sendLoader = EdlSendLoaderCheckBox?.IsChecked == true;
             var targetLuns = _edlPartitions

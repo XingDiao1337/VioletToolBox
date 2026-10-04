@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
-    <AssemblyName>violet_payload</AssemblyName>
+    <AssemblyName>yuzaki_payload</AssemblyName>
     <RootNamespace>Payload_Dumper_C_</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

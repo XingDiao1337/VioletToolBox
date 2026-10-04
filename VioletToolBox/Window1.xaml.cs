@@ -27,6 +27,15 @@ namespace SmartTool
         public Window1()
         {
             InitializeComponent();
+            try
+            {
+                string iconPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo2.ico");
+                if (System.IO.File.Exists(iconPath))
+                {
+                    this.Icon = System.Windows.Media.Imaging.BitmapFrame.Create(new Uri(iconPath));
+                }
+            }
+            catch { }
         }
 
         private void Border_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)

@@ -34,9 +34,7 @@ using WpfCursors = System.Windows.Input.Cursors;
 using WpfOrientation = System.Windows.Controls.Orientation;
 using WpfPoint = System.Windows.Point;
 using SmartTool;
-using WpfApp1.Avb;
-using test1;
-using OPFlashTool.Services;
+using System.Security.Cryptography;
 
 namespace WpfApp1
 {
@@ -275,18 +273,27 @@ namespace WpfApp1
             }
         }
 
-        public double StorageUsedGB => (_storageUsage / 100) * _totalStorage;
-        public double MemoryUsedGB => (_memoryUsage / 100) * _totalMemory;
+        public double StorageUsedGB => (_storage_usage_safe / 100.0) * _totalStorage;
+        public double MemoryUsedGB => (_memory_usage_safe / 100.0) * _totalMemory;
 
-        public string StorageText => $"{StorageUsedGB:F2}GB/{_totalStorage}GB";
-        public string MemoryText => $"{MemoryUsedGB:F0}GB/{_totalMemory:F0}GB";
+        public string StorageText => _totalStorage > 0 ? $"{StorageUsedGB:F1}GB/{_totalStorage:F0}GB" : "--";
+        public string MemoryText => _totalMemory > 0 ? $"{MemoryUsedGB:F1}GB/{_totalMemory:F0}GB" : "--";
 
         private const double CircleCircumference = 471.239;
         public double StrokeThickness => 12;
         private double CircumferenceUnits => CircleCircumference / StrokeThickness;
-        public DoubleCollection StorageDashArray => new DoubleCollection { CircumferenceUnits * (_storageUsage / 100), CircumferenceUnits * (1 - _storageUsage / 100) };
-        public DoubleCollection MemoryDashArray => new DoubleCollection { CircumferenceUnits * (_memoryUsage / 100), CircumferenceUnits * (1 - _memory_usage_safe) };
+        public DoubleCollection StorageDashArray => new DoubleCollection 
+        { 
+            Math.Max(0, CircumferenceUnits * (_storage_usage_safe / 100.0)), 
+            Math.Max(0, CircumferenceUnits * (1.0 - _storage_usage_safe / 100.0)) 
+        };
+        public DoubleCollection MemoryDashArray => new DoubleCollection 
+        { 
+            Math.Max(0, CircumferenceUnits * (_memory_usage_safe / 100.0)), 
+            Math.Max(0, CircumferenceUnits * (1.0 - _memory_usage_safe / 100.0)) 
+        };
 
+        private double _storage_usage_safe => Math.Max(0, Math.Min(100, _storageUsage));
         private double _memory_usage_safe => Math.Max(0, Math.Min(100, _memoryUsage));
 
         public void SetTotalMemory(double gb)
@@ -314,8 +321,17 @@ namespace WpfApp1
     }
 
 
+
+
     public partial class MainWindow : Window, INotifyPropertyChanged
     {
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        protected virtual void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
         private string _CurrentView = "Home";
         public string CurrentView
         {
@@ -329,36 +345,577 @@ namespace WpfApp1
                 }
             }
         }
+
         private StorageViewModel _storageViewModel;
         private DispatcherTimer? _storageTimer;
-        public event PropertyChangedEventHandler PropertyChanged;
+
+        private ObservableCollection<string> deviceSerials = new ObservableCollection<string>();
+        public ObservableCollection<string> DeviceSerials
+        {
+            get => deviceSerials;
+            set
+            {
+                deviceSerials = value;
+                OnPropertyChanged(nameof(DeviceSerials));
+            }
+        }
+
+        private DispatcherTimer? deviceStatusTimer;
+        private int _deviceDetectionVersion = 0;
+        private bool _isDeviceDetectionEnabled = true;
+        private readonly SemaphoreSlim _deviceDetectionLock = new SemaphoreSlim(1, 1);
+
+        private string currentView = "Home";
+        private string currentFlashingPartition = "";
+        private StringBuilder fastbootCompleteLog = new StringBuilder();
+        private ObservableCollection<AppPackageItem> AppPackages = new ObservableCollection<AppPackageItem>();
+
+        private string lastKernelVersion = "";
+        private string lastBuildDate = "";
+        private string lastCpuManufacturer = "";
+        private string lastCpuCodeName = "";
+        private string lastWindowsVersion = "";
+        private string lastDeviceStatus = "";
+        private string lastConnectionType = "";
+        private string lastDeviceSerial = "";
+        private string lastDeviceModel = "";
+        private string lastDeviceCode = "";
+        private string lastAndroidVersion = "";
+        private string lastUnlockStatus = "";
+        private string lastABPartition = "";
+        private string lastSelinuxStatus = "";
+        private string? _parsedXiaomiFlashScriptPath;
+        private string[]? _parsedXiaomiFlashScriptLines;
+        private IReadOnlyList<string> _parsedRawProgramPaths = Array.Empty<string>();
+        private string? _parsedRawProgramDisplayText;
+
+        private Process? scrcpyProcess = null;
+        private bool isScrcpyStarting = false;
+        private Window? scrcpyControlBarWindow = null;
+        private DispatcherTimer? scrcpyControlBarTimer = null;
+        private IntPtr scrcpyMainWindowHandle = IntPtr.Zero;
+        private IntPtr scrcpyLocationChangeHook = IntPtr.Zero;
+        private WinEventDelegate? scrcpyLocationChangeProc = null;
+        private readonly ConcurrentQueue<string> screenMirrorLogQueue = new();
+        private DispatcherTimer? screenMirrorLogFlushTimer = null;
+        private int screenMirrorLogPumpActive = 0;
+        private const int ScreenMirrorLogMaxCharacters = 1_000;
+        private const int ScreenMirrorLogMaxBatchCharacters = 4_096;
+        private readonly List<string> _mirrorTitleSelectionOrder = new();
+        private bool isAutoMirrorEnabled = false;
+        private DispatcherTimer? autoMirrorTimer;
+
+        private XiaomiFlashProgressState? _xiaomiFlashProgressState;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            GuardianService.InitializeGuardian();
+
+            try
+            {
+                string iconPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo2.ico");
+                if (System.IO.File.Exists(iconPath))
+                {
+                    this.Icon = System.Windows.Media.Imaging.BitmapFrame.Create(new Uri(iconPath));
+                }
+                else
+                {
+                    var sri = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/logo2.ico"));
+                    if (sri?.Stream != null)
+                    {
+                        this.Icon = System.Windows.Media.Imaging.BitmapFrame.Create(sri.Stream);
+                    }
+                }
+            }
+            catch { }
+
+            this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            _storageViewModel = new StorageViewModel();
+            this.DataContext = this;
+            if (StorageMemoryBorder != null)
+            {
+                StorageMemoryBorder.DataContext = _storageViewModel;
+            }
+
+            InitializeDeviceStatusMonitoring();
+            MultiDeviceComboBox.ItemsSource = DeviceSerials;
+            if (this.FindName("AppListDataGrid") is DataGrid appListDataGrid)
+            {
+                appListDataGrid.ItemsSource = AppPackages;
+            }
+
+            SwitchToActiveView("Home");
+
+            _storageTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(10)
+            };
+            _storageTimer.Tick += async (s, e) => await RefreshStorageMemoryAsync(true);
+            _storageTimer.Start();
+
+            this.Loaded += async (s, e) => await RefreshStorageMemoryAsync();
+            this.Loaded += MainWindow_Loaded;
+            this.Activated += (s, e) => ClearScrcpyWindowTopMost();
+            this.LocationChanged += (s, e) => UpdateScrcpyControlBarPosition();
+            this.SizeChanged += (s, e) => UpdateScrcpyControlBarPosition();
+            this.StateChanged += (s, e) =>
+            {
+                ClearScrcpyWindowTopMost();
+                UpdateScrcpyControlBarPosition();
+            };
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            SwitchToActiveView("Home");
+            if (this.FindName("HomeButton") is HandyControl.Controls.SideMenuItem homeItem)
+            {
+                homeItem.IsSelected = true;
+            }
+            if (this.FindName("LoadingOverlay") is Grid overlay && this.FindName("LoadingContent") is Grid content)
+            {
+                overlay.Visibility = Visibility.Collapsed;
+                content.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private bool _isClosingCleanedUp;
+        private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            if (!_isClosingCleanedUp)
+            {
+                // 关闭二次确认弹窗
+                var confirmResult = System.Windows.MessageBox.Show(
+                    this,
+                    "确定要退出 Yuzaki 工具箱吗？",
+                    "退出确认",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question,
+                    MessageBoxResult.No);
+
+                if (confirmResult != MessageBoxResult.Yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+
+                _isClosingCleanedUp = true;
+
+                try
+                {
+                    // 停止设备状态监控与自动投屏定时器
+                    deviceStatusTimer?.Stop();
+                    deviceStatusTimer = null;
+                    StopAutoMirrorTimer();
+
+                    // 通知内存守护程序：用户确认退出，将在主进程退出后清理 C:\Yuzaki Tool Box 目录并自毁
+                    GuardianService.SignalExitConfirmed();
+
+                    // 立即隐藏主窗口，不显示任何清理弹窗
+                    this.Hide();
+
+                    // 异步杀掉 adb/fastboot/scrcpy，不阻塞也不弹窗
+                    _ = KillAllAdbAndFastbootProcesses();
+                    _ = KillAllScrcpyProcesses();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"关闭退出处理异常: {ex.Message}");
+                }
+
+                // 完全关闭应用程序
+                System.Windows.Application.Current.Shutdown();
+            }
+        }
+
+        public void SwitchToActiveView(string activeViewName)
+        {
+            if (this.FindName("HomeView") is Grid homeView) homeView.Visibility = activeViewName == "Home" ? Visibility.Visible : Visibility.Collapsed;
+            if (this.FindName("ScreenMirrorView") is Grid screenMirrorView) screenMirrorView.Visibility = activeViewName == "ScreenMirror" ? Visibility.Visible : Visibility.Collapsed;
+            if (this.FindName("BasicFlashView") is Grid basicFlashView) basicFlashView.Visibility = activeViewName == "BasicFlash" ? Visibility.Visible : Visibility.Collapsed;
+            if (this.FindName("EdlFlashView") is Grid edlFlashView) edlFlashView.Visibility = activeViewName == "EdlFlash" ? Visibility.Visible : Visibility.Collapsed;
+            if (this.FindName("AppManagementView") is Grid appManagementView) appManagementView.Visibility = activeViewName == "AppManagement" ? Visibility.Visible : Visibility.Collapsed;
+            if (this.FindName("PayloadView") is Grid payloadView) payloadView.Visibility = activeViewName == "Payload" ? Visibility.Visible : Visibility.Collapsed;
+
+            var menuMap = new Dictionary<string, string>
+            {
+                ["Home"] = "HomeButton",
+                ["ScreenMirror"] = "ScreenMirrorButton",
+                ["BasicFlash"] = "BasicFlashButton",
+                ["EdlFlash"] = "EdlFlashButton",
+                ["AppManagement"] = "AppManagementButton",
+                ["Payload"] = "PayloadButton"
+            };
+
+            if (menuMap.TryGetValue(activeViewName, out string? targetBtnName))
+            {
+                var allItems = new[] { HomeButton, ScreenMirrorButton, BasicFlashButton, EdlFlashButton, AppManagementButton, PayloadButton };
+                foreach (var item in allItems)
+                {
+                    if (item != null)
+                    {
+                        item.IsSelected = (item.Name == targetBtnName);
+                    }
+                }
+            }
+
+            UpdateButtonStates(activeViewName);
+            currentView = activeViewName;
+        }
+
+        private void UpdateButtonStates(string activeView)
+        {
+            CurrentView = activeView;
+            currentView = activeView;
+        }
+
+        private void ClearOtherSideMenuItemsSelection(HandyControl.Controls.SideMenuItem selectedItem)
+        {
+            var allItems = new HandyControl.Controls.SideMenuItem[]
+            {
+                HomeButton, ScreenMirrorButton, BasicFlashButton,
+                EdlFlashButton, AppManagementButton, PayloadButton
+            };
+
+            foreach (var item in allItems)
+            {
+                if (item != null && item != selectedItem)
+                {
+                    item.IsSelected = false;
+                }
+            }
+        }
+
+        private void SideMenu_SelectionChanged(object sender, HandyControl.Data.FunctionEventArgs<object> e)
+        {
+            if (e.Info is HandyControl.Controls.SideMenuItem item)
+            {
+                ClearOtherSideMenuItemsSelection(item);
+
+                switch (item.Name)
+                {
+                    case "HomeButton": SwitchToActiveView("Home"); break;
+                    case "ScreenMirrorButton": SwitchToActiveView("ScreenMirror"); break;
+                    case "BasicFlashButton": SwitchToActiveView("BasicFlash"); break;
+                    case "EdlFlashButton": SwitchToActiveView("EdlFlash"); break;
+                    case "AppManagementButton": SwitchToActiveView("AppManagement"); break;
+                    case "PayloadButton": SwitchToActiveView("Payload"); break;
+                }
+            }
+        }
+
+        private void DirectItem_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is HandyControl.Controls.SideMenuItem item)
+            {
+                ClearOtherSideMenuItemsSelection(item);
+                item.IsSelected = true;
+
+                switch (item.Name)
+                {
+                    case "HomeButton": SwitchToActiveView("Home"); break;
+                    case "ScreenMirrorButton": SwitchToActiveView("ScreenMirror"); break;
+                    case "BasicFlashButton": SwitchToActiveView("BasicFlash"); break;
+                    case "EdlFlashButton": SwitchToActiveView("EdlFlash"); break;
+                    case "AppManagementButton": SwitchToActiveView("AppManagement"); break;
+                    case "PayloadButton": SwitchToActiveView("Payload"); break;
+                }
+            }
+        }
+
+        private void SideMenuScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (sender is ScrollViewer scrollViewer)
+            {
+                scrollViewer.ScrollToVerticalOffset(scrollViewer.VerticalOffset - e.Delta);
+                e.Handled = true;
+            }
+        }
+
+        private void HomeButton_Click(object sender, RoutedEventArgs? e) => SwitchToActiveView("Home");
+        private void ScreenMirrorButton_Click(object sender, RoutedEventArgs? e) => SwitchToActiveView("ScreenMirror");
+        private void BasicFlashButton_Click(object sender, RoutedEventArgs? e) => SwitchToActiveView("BasicFlash");
+        private void EdlFlashButton_Click(object sender, RoutedEventArgs? e) => SwitchToActiveView("EdlFlash");
+        private void AppManagementButton_Click(object sender, RoutedEventArgs? e) => SwitchToActiveView("AppManagement");
+
+        private static void SetLocalizedText(TextBlock? textBlock, string rawText)
+        {
+            if (textBlock != null)
+            {
+                textBlock.Text = rawText;
+            }
+        }
+
+        private async Task TryIncrementOpenCountAsync()
+        {
+            await Task.CompletedTask;
+        }
+
+        private static string ApplyViolettoolSignIfNeeded(string url) => url;
+
+        private static string CleanLink(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var s = value.Trim().Trim('`', '"', '\'', ' ');
+            return s.Trim();
+        }
+
+        private static bool IsMeizuDownloadEntryLink(string url)
+        {
+            url = CleanLink(url);
+            return !string.IsNullOrWhiteSpace(url) &&
+                   url.Contains("flyme.com/zh/download?key=", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Dictionary<string, string> BuildMeizuRequestHeaders(string referer)
+        {
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            referer = CleanLink(referer);
+            if (!string.IsNullOrWhiteSpace(referer))
+            {
+                headers["Referer"] = referer;
+            }
+            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SmartTool";
+            return headers;
+        }
+
+        private static string NormalizeUrlForRequest(string url)
+        {
+            url = CleanLink(url);
+            if (string.IsNullOrWhiteSpace(url)) return string.Empty;
+            if (Uri.TryCreate(url, UriKind.Absolute, out var uri)) return uri.ToString();
+            var schemeSepIndex = url.IndexOf("://", StringComparison.Ordinal);
+            if (schemeSepIndex < 0) return url;
+            var pathStart = url.IndexOf('/', schemeSepIndex + 3);
+            if (pathStart < 0) return url;
+            var basePart = url.Substring(0, pathStart);
+            var rest = url.Substring(pathStart);
+            string pathPart;
+            string queryPart = string.Empty;
+            var queryIndex = rest.IndexOf('?', StringComparison.Ordinal);
+            if (queryIndex >= 0)
+            {
+                pathPart = rest.Substring(0, queryIndex);
+                queryPart = rest.Substring(queryIndex);
+            }
+            else
+            {
+                pathPart = rest;
+            }
+            var escapedPath = string.Join("/", pathPart.Split(new[] { '/' }, StringSplitOptions.None).Select(Uri.EscapeDataString));
+            return basePart + escapedPath + queryPart;
+        }
+
+        private async Task<string> ExecuteAdbCommandWithOutput(string command, CancellationToken cancellationToken = default)
+        {
+            Process? process = null;
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string adbPath = GetToolPath("adb.exe");
+                string selectedSerial = GetSelectedDeviceSerial();
+                string arguments = string.IsNullOrWhiteSpace(selectedSerial) ? command : $"-s {selectedSerial} {command}";
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = adbPath,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = File.Exists(adbPath) ? (Path.GetDirectoryName(adbPath) ?? AppDomain.CurrentDomain.BaseDirectory) : AppDomain.CurrentDomain.BaseDirectory
+                };
+
+                process = Process.Start(startInfo);
+                if (process == null) return "Error: Process could not be started.";
+
+                Task<string> outputTask;
+                Task<string> errorTask;
+                using (var outputReader = new StreamReader(process.StandardOutput.BaseStream, new UTF8Encoding(false), true))
+                using (var errorReader = new StreamReader(process.StandardError.BaseStream, new UTF8Encoding(false), true))
+                {
+                    outputTask = outputReader.ReadToEndAsync();
+                    errorTask = errorReader.ReadToEndAsync();
+                    await process.WaitForExitAsync(cancellationToken);
+                    await Task.WhenAll(outputTask, errorTask);
+                }
+
+                string output = await outputTask;
+                string error = await errorTask;
+                return string.Join(Environment.NewLine, new[] { output.Trim(), error.Trim() }.Where(text => !string.IsNullOrWhiteSpace(text)));
+            }
+            catch (OperationCanceledException)
+            {
+                try { if (process != null && !process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+            finally
+            {
+                process?.Dispose();
+            }
+        }
+
+        private async Task KillAllAdbAndFastbootProcesses()
+        {
+            try
+            {
+                var adbProcesses = Process.GetProcessesByName("adb");
+                foreach (var process in adbProcesses)
+                {
+                    try { process.Kill(); await process.WaitForExitAsync(); } catch { }
+                    finally { process.Dispose(); }
+                }
+
+                var fastbootProcesses = Process.GetProcessesByName("fastboot");
+                foreach (var process in fastbootProcesses)
+                {
+                    try { process.Kill(); await process.WaitForExitAsync(); } catch { }
+                    finally { process.Dispose(); }
+                }
+            }
+            catch { }
+        }
+
+        private async Task KillAllScrcpyProcesses()
+        {
+            try
+            {
+                var scrcpyProcesses = Process.GetProcessesByName("scrcpy");
+                foreach (var process in scrcpyProcesses)
+                {
+                    try { process.Kill(); await process.WaitForExitAsync(); } catch { }
+                    finally { process.Dispose(); }
+                }
+            }
+            catch { }
+        }
+
+        private async Task KillAllFastbootProcesses()
+        {
+            try
+            {
+                var fastbootProcesses = Process.GetProcessesByName("fastboot");
+                foreach (var process in fastbootProcesses)
+                {
+                    try { process.Kill(); await process.WaitForExitAsync(); } catch { }
+                    finally { process.Dispose(); }
+                }
+            }
+            catch { }
+        }
+
+        private void UpdateTransferRateText(string text)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                if (bootflash != null)
+                {
+                    bootflash.Tag = text;
+                }
+                if (this.FindName("TransferRateTextBlock") is TextBlock trTb)
+                {
+                    trTb.Text = text;
+                }
+            });
+        }
+
+        private void StartScreenMirrorLogPump()
+        {
+            if (screenMirrorLogFlushTimer == null)
+            {
+                screenMirrorLogFlushTimer = new DispatcherTimer(DispatcherPriority.Background)
+                {
+                    Interval = TimeSpan.FromMilliseconds(100)
+                };
+                screenMirrorLogFlushTimer.Tick += (s, e) => FlushScreenMirrorLogQueue();
+            }
+            screenMirrorLogFlushTimer.Start();
+        }
+
+        private void AppendToLogTextBox(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return;
+            screenMirrorLogQueue.Enqueue(message);
+            if (Interlocked.CompareExchange(ref screenMirrorLogPumpActive, 1, 0) != 0) return;
+
+            if (Dispatcher.CheckAccess())
+            {
+                StartScreenMirrorLogPump();
+            }
+            else
+            {
+                try { Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(StartScreenMirrorLogPump)); }
+                catch { Interlocked.Exchange(ref screenMirrorLogPumpActive, 0); }
+            }
+        }
+
+        private void FlushScreenMirrorLogQueue()
+        {
+            var batch = new StringBuilder();
+            while (batch.Length < ScreenMirrorLogMaxBatchCharacters && screenMirrorLogQueue.TryDequeue(out string? message))
+            {
+                batch.Append(message);
+            }
+
+            var logTextBox = this.FindName("ScreenMirrorLogTextBox") as System.Windows.Controls.TextBox;
+            if (logTextBox != null && batch.Length > 0)
+            {
+                string batchText = batch.ToString();
+                if (logTextBox.Text.Length + batchText.Length <= ScreenMirrorLogMaxCharacters)
+                {
+                    logTextBox.AppendText(batchText);
+                }
+                else
+                {
+                    string combined = logTextBox.Text + batchText;
+                    int startIndex = Math.Max(0, combined.Length - ScreenMirrorLogMaxCharacters);
+                    int firstLineBreak = combined.IndexOf('\n', startIndex);
+                    if (firstLineBreak >= startIndex && firstLineBreak < combined.Length - 1)
+                    {
+                        startIndex = firstLineBreak + 1;
+                    }
+                    logTextBox.Text = combined.Substring(startIndex);
+                    logTextBox.CaretIndex = logTextBox.Text.Length;
+                }
+                logTextBox.ScrollToEnd();
+            }
+
+            if (!screenMirrorLogQueue.IsEmpty) return;
+            screenMirrorLogFlushTimer?.Stop();
+            Interlocked.Exchange(ref screenMirrorLogPumpActive, 0);
+
+            if (!screenMirrorLogQueue.IsEmpty && Interlocked.CompareExchange(ref screenMirrorLogPumpActive, 1, 0) == 0)
+            {
+                StartScreenMirrorLogPump();
+            }
+        }
 
         private void CopyTextBlockContent(object sender, MouseButtonEventArgs e)
         {
-            var tb = sender as TextBlock;
-            if (tb == null) return;
-            var text = tb.Text;
-            if (string.IsNullOrEmpty(text) && tb.Inlines != null)
+            if (sender is TextBlock textBlock)
             {
-                text = string.Concat(tb.Inlines.Select(il =>
+                string text = textBlock.Text;
+                if (!string.IsNullOrEmpty(text) && text != "--" && text != "未知" && text != "单击复制")
                 {
-                    if (il is Run r) return r.Text;
-                    if (il is Span s) return string.Concat(s.Inlines.OfType<Run>().Select(r => r.Text));
-                    return string.Empty;
-                }));
-            }
-            if (!string.IsNullOrEmpty(text))
-            {
-                try
-                {
-                    System.Windows.Clipboard.SetText(text);
-                }
-                catch
-                {
+                    try
+                    {
+                        System.Windows.Clipboard.SetText(text);
+                        ShowCopyToast();
+                    }
+                    catch (Exception ex)
+                    {
+                        AddLogMessage("错误", $"复制到剪贴板失败: {ex.Message}");
+                    }
                 }
             }
-            e.Handled = true;
         }
+
         private string GetTextFromTextBlock(TextBlock tb)
         {
             if (tb == null) return string.Empty;
@@ -369,6 +926,7 @@ namespace WpfApp1
             }
             return text ?? string.Empty;
         }
+
         private void SaveDeviceInfoText_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
             e.Handled = true;
@@ -405,517 +963,123 @@ namespace WpfApp1
                 IOFile.WriteAllText(dlg.FileName, sb.ToString(), Encoding.UTF8);
             }
         }
-        protected virtual void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
 
-        private void ClearOtherSideMenuItemsSelection(HandyControl.Controls.SideMenuItem selectedItem)
+        private void ShowCopyToast()
         {
-            var allItems = new HandyControl.Controls.SideMenuItem[]
+            if (this.FindName("CopyToastBorder") is Border border)
             {
-                HomeButton, ScreenMirrorButton, AboutToolButton,
-                BasicFlashButton, FastbootVisualizationButton, OugaFlashButton,
-                EdlFlashButton, ColorOSAssistantButton, HiddenEnvironmentButton,
-                SystemZoneButton, AutorootButton, AppManagementButton,
-                AndroidGeneralButton, PayloadButton, BackupAssistantButton,
-                DownloadZoneButton, RomDownload, VioletDownload
-            };
-
-            foreach (var item in allItems)
-            {
-                if (item != null && item != selectedItem)
-                {
-                    item.IsSelected = false;
-                }
+                var anim = this.Resources["FadeInOutAnimation"] as System.Windows.Media.Animation.Storyboard;
+                border.Visibility = Visibility.Visible;
+                anim?.Begin();
             }
         }
 
-        private void SideMenu_SelectionChanged(object sender, HandyControl.Data.FunctionEventArgs<object> e)
+        private void BitrateSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            // 对于 Freedom 模式，点击已经选中的项也应该触发切换逻辑
-            // 另外，对于一级菜单项，我们需要检查它是否被点击，即使用户只是点击了它的标题区域
-            if (e.Info is HandyControl.Controls.SideMenuItem item)
+            if (this.FindName("BitrateValueText") is TextBlock bitrateValueText)
             {
-                ClearOtherSideMenuItemsSelection(item);
-
-                switch (item.Name)
-                {
-                    case "HomeButton": HomeButton_Click(this, null); break;
-                    case "ScreenMirrorButton": ScreenMirrorButton_Click(this, null); break;
-                    case "BasicFlashButton": BasicFlashButton_Click(this, null); break;
-                    case "FastbootVisualizationButton": FastbootVisualizationButton_Click(this, null); break;
-                    case "HiddenEnvironmentButton": HiddenEnvironmentButton_Click(this, null); break;
-                    case "SystemZoneButton": SystemZoneButton_Click(this, null); break;
-                    case "OugaFlashButton": OugaFlashButton_Click(this, null); break;
-                    case "AutorootButton": AutorootButton_Click(this, null); break;
-                    case "AppManagementButton": AppManagementButton_Click(this, null); break;
-                    case "AndroidGeneralButton": AndroidGeneralButton_Click(this, null); break;
-                    case "DownloadZoneButton": DownloadZoneButton_Click(this, null); break;
-                    case "PayloadButton": PayloadButton_Click(this, null); break;
-                    case "RomDownload": RomDownloadButton_Click(this, null); break;
-                    case "VioletDownload": VioletDownloadButton_Click(this, null); break;
-                    case "EdlFlashButton": EdlFlashButton_Click(this, null); break;
-                    case "ColorOSAssistantButton": ColorOSAssistantButton_Click(this, null); break;
-                    case "BackupAssistantButton": BackupAssistantButton_Click(this, null); break;
-                    case "AboutToolButton": AboutToolButton_Click(this, null); break;
-                }
-            }
-        }
-        
-        // 为了解决需要点击两次的问题，我们添加对一级菜单的直接点击响应
-        private void DirectItem_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            if (sender is HandyControl.Controls.SideMenuItem item)
-            {
-                // 先取消其他所有项的选中状态
-                ClearOtherSideMenuItemsSelection(item);
-                
-                // 设置当前项为选中状态，并触发选中事件
-                item.IsSelected = true;
-                
-                // 强制触发对应的视图切换
-                switch (item.Name)
-                {
-                    case "HomeButton": HomeButton_Click(this, null); break;
-                    case "ScreenMirrorButton": ScreenMirrorButton_Click(this, null); break;
-                    case "AboutToolButton": AboutToolButton_Click(this, null); break;
-                    case "BasicFlashButton": BasicFlashButton_Click(this, null); break;
-                    case "FastbootVisualizationButton": FastbootVisualizationButton_Click(this, null); break;
-                    case "OugaFlashButton": OugaFlashButton_Click(this, null); break;
-                    case "EdlFlashButton": EdlFlashButton_Click(this, null); break;
-                    case "ColorOSAssistantButton": ColorOSAssistantButton_Click(this, null); break;
-                    case "HiddenEnvironmentButton": HiddenEnvironmentButton_Click(this, null); break;
-                    case "SystemZoneButton": SystemZoneButton_Click(this, null); break;
-                    case "AutorootButton": AutorootButton_Click(this, null); break;
-                    case "AppManagementButton": AppManagementButton_Click(this, null); break;
-                    case "AndroidGeneralButton": AndroidGeneralButton_Click(this, null); break;
-                    case "PayloadButton": PayloadButton_Click(this, null); break;
-                    case "BackupAssistantButton": BackupAssistantButton_Click(this, null); break;
-                    case "DownloadZoneButton": DownloadZoneButton_Click(this, null); break;
-                    case "RomDownload": RomDownloadButton_Click(this, null); break;
-                    case "VioletDownload": VioletDownloadButton_Click(this, null); break;
-                }
+                bitrateValueText.Text = ((int)e.NewValue).ToString();
             }
         }
 
-        // 解决左侧导航栏无法使用鼠标滚轮滚动的问题
-        private void SideMenuScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        private void MaxFpsSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (sender is ScrollViewer scrollViewer)
+            if (this.FindName("MaxFpsValueText") is TextBlock maxFpsValueText)
             {
-                // 将鼠标滚轮的滚动量应用到 ScrollViewer 上
-                scrollViewer.ScrollToVerticalOffset(scrollViewer.VerticalOffset - e.Delta);
-                e.Handled = true; // 标记事件已处理，防止事件继续向上传递引发其他问题
+                maxFpsValueText.Text = ((int)e.NewValue).ToString();
             }
         }
 
-        private DispatcherTimer? deviceStatusTimer;
-        private bool _isDeviceDetectionEnabled = true;
-        private int _deviceDetectionVersion;
-        private readonly SemaphoreSlim _deviceDetectionLock = new(1, 1);
-        private DispatcherTimer? autoMirrorTimer; // 全自动投屏定时器
-        private string lastDeviceStatus = "";
-        private string lastConnectionType = "";
-        private string lastDeviceSerial = "";
-        private string lastDeviceModel = "";
-        private string lastDeviceCode = "";
-        private string lastAndroidVersion = "";
-        private string lastUnlockStatus = "";
-        private string lastABPartition = "";
-        private string lastSelinuxStatus = "";
-        private System.Collections.ObjectModel.ObservableCollection<PartitionInfo> allPartitions;
-        private readonly HashSet<PartitionInfo> _partitionSummarySubscriptions = new();
-        private string? _parsedXiaomiFlashScriptPath;
-        private string[]? _parsedXiaomiFlashScriptLines;
-        private IReadOnlyList<string> _parsedRawProgramPaths = Array.Empty<string>();
-        private string? _parsedRawProgramDisplayText;
-        private XiaomiFlashProgressState? _xiaomiFlashProgressState;
+        private void ScreenMirrorLogTextBox_TextChanged(object sender, TextChangedEventArgs e) { }
+        private void AutoRebootCheckBox_Checked(object sender, RoutedEventArgs e) { }
+        private void XiaomiFlashScriptPathTextBox_TextChanged(object sender, TextChangedEventArgs e) { }
 
-        private sealed class XiaomiFlashProgressItem
+        private void CompleteWipeCheckBox_Checked(object sender, RoutedEventArgs e)
         {
-            public XiaomiFlashProgressItem(string partitionName, long length)
+            if (sender is System.Windows.Controls.CheckBox checkBox && checkBox.IsChecked == true)
             {
-                PartitionName = partitionName;
-                Length = length;
-            }
-
-            public string PartitionName { get; }
-            public long Length { get; }
-        }
-
-        private sealed class XiaomiFlashProgressState
-        {
-            public XiaomiFlashProgressState(IReadOnlyList<XiaomiFlashProgressItem> items)
-            {
-                Items = items;
-                TotalBytes = items.Sum(item => item.Length);
-                Elapsed = Stopwatch.StartNew();
-            }
-
-            public IReadOnlyList<XiaomiFlashProgressItem> Items { get; }
-            public long TotalBytes { get; }
-            public Stopwatch Elapsed { get; }
-            public int CurrentItemIndex { get; set; } = -1;
-            public long CompletedBytes { get; set; }
-            public long CurrentItemTransferredBytes { get; set; }
-            public long CompletedChunkBytes { get; set; }
-            public long CurrentChunkExpectedBytes { get; set; }
-            public long CurrentChunkReportedBytes { get; set; }
-            public long LastReportedBytes { get; set; }
-            public bool CurrentCommandFinished { get; set; }
-            public string TransferRate { get; set; } = "0MB/s";
-        }
-
-        private enum XiaomiFlashMode
-        {
-            Traditional,
-            SlotA
-        }
-        private string lastKernelVersion = "";
-        private string lastBuildDate = "";
-        private string lastCpuManufacturer = "";
-        private string lastCpuCodeName = "";
-        private string lastWindowsVersion = "";
-        private Process? scrcpyProcess = null; // 跟踪scrcpy进程
-        private bool isScrcpyStarting = false; // 防止启动过程中重复创建scrcpy进程
-        private Window? scrcpyControlBarWindow = null;
-        private DispatcherTimer? scrcpyControlBarTimer = null;
-        private IntPtr scrcpyMainWindowHandle = IntPtr.Zero;
-        private IntPtr scrcpyLocationChangeHook = IntPtr.Zero;
-        private WinEventDelegate? scrcpyLocationChangeProc = null;
-        private readonly ConcurrentQueue<string> screenMirrorLogQueue = new();
-        private DispatcherTimer? screenMirrorLogFlushTimer = null;
-        private int screenMirrorLogPumpActive = 0;
-        private const int ScreenMirrorLogMaxCharacters = 1_000;
-        private const int ScreenMirrorLogMaxBatchCharacters = 4_096;
-        private readonly List<string> _mirrorTitleSelectionOrder = new();
-        private bool isAutoMirrorEnabled = false; // 全自动投屏开关
-        private string currentView = "Home"; 
-        private string lastLoadedDirectory = "/sdcard/"; // 存储上次加载的手机目录路径
-        private string lastSelectedFileName = ""; // 存储用户最后选中的文件名
-        private string currentPath = "/sdcard/"; // 存储当前文件夹路径
-        private readonly SemaphoreSlim _systemZoneTransferLock = new(1, 1);
-        private FileItem? _systemZoneContextMenuItem;
-        private bool _hasAutoLoadedSystemZoneDirectory;
-        private CancellationTokenSource? _systemZoneImagePreviewCancellation;
-        private string currentFlashingPartition = ""; // 存储当前正在刷入的分区名称
-        private StringBuilder fastbootCompleteLog = new StringBuilder(); // 存储所有fastboot命令的完整输出
-        private ObservableCollection<AppPackageItem> AppPackages = new ObservableCollection<AppPackageItem>();
-        private string? magiskApkPath;
-        private string magiskbootPath = string.Empty;
-        private string tempDir = string.Empty;
-        private const string DriverListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/qudong.json";
-        private const string RootManagerListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/rootmanager.json";
-        private const string Kernel4ListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/kernel4.json";
-        private const string OnePlusAk3ListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/oneplusak3";
-        private const string OujiaAk3ListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/oujia.json";
-        private const string AndroidAk3ListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/android.json";
-        private const string UtilitySoftwareListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/apk.json";
-        private const string UserUploadListSourceUrl = "https://violettool.top/public.json";
-        private static readonly HttpClient DriverListHttpClient = new HttpClient();
-        private bool _isLoadingDriverList;
-        private bool _isLoadingRootManagerList;
-        private bool _isLoadingKernel4List;
-        private bool _isLoadingOnePlusAk3List;
-        private bool _isLoadingOujiaAk3List;
-        private bool _isLoadingAndroidAk3List;
-        private bool _isLoadingUtilitySoftwareList;
-        private bool _isLoadingUserUploadList;
-
-        // 设备序列号集合
-        private ObservableCollection<string> deviceSerials = new ObservableCollection<string>();
-        public ObservableCollection<string> DeviceSerials
-        {
-            get { return deviceSerials; }
-            set
-            {
-                deviceSerials = value;
-                OnPropertyChanged(nameof(DeviceSerials));
+                if (this.FindName("KeepDataCheckBox") is System.Windows.Controls.CheckBox keepData) keepData.IsChecked = false;
+                if (this.FindName("WipeAndLockBLCheckBox") is System.Windows.Controls.CheckBox lockBl) lockBl.IsChecked = false;
             }
         }
 
-        private async Task<bool> ExecuteFastbootCommandFromScriptWithCustomLog(
-            string commandLine,
-            string scriptPath,
-            string fastbootPath,
-            System.Windows.Controls.RichTextBox logTextBox,
-            string partitionName,
-            string? sourceFileName = null,
-            bool trackDetailedPartitionStatus = true,
-            bool applyScriptVerificationOptions = false,
-            CancellationToken cancellationToken = default)
+        private void KeepDataCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            if (sender is System.Windows.Controls.CheckBox checkBox && checkBox.IsChecked == true)
+            {
+                if (this.FindName("CompleteWipeCheckBox") is System.Windows.Controls.CheckBox completeWipe) completeWipe.IsChecked = false;
+                if (this.FindName("WipeAndLockBLCheckBox") is System.Windows.Controls.CheckBox lockBl) lockBl.IsChecked = false;
+            }
+        }
+
+        private void WipeAndLockBLCheckBox_Checked_1(object sender, RoutedEventArgs e)
+        {
+            if (sender is System.Windows.Controls.CheckBox checkBox && checkBox.IsChecked == true)
+            {
+                if (this.FindName("CompleteWipeCheckBox") is System.Windows.Controls.CheckBox completeWipe) completeWipe.IsChecked = false;
+                if (this.FindName("KeepDataCheckBox") is System.Windows.Controls.CheckBox keepData) keepData.IsChecked = false;
+            }
+        }
+
+        private void FlashLogTextBox_TextChanged_2(object sender, TextChangedEventArgs e)
+        {
+            if (sender is System.Windows.Controls.TextBox textBox)
+            {
+                textBox.ScrollToEnd();
+            }
+        }
+
+        private void CmdButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (applyScriptVerificationOptions)
-                {
-                    commandLine = ApplyFastbootVerificationOptions(commandLine, partitionName);
-                }
-                string processedCommand = commandLine.Replace("fastboot %*", "fastboot")
-                                                    .Replace("%~dp0images/", Path.Combine(scriptPath, "images") + Path.DirectorySeparatorChar)
-                                                    .Replace("%~dp0images\\", Path.Combine(scriptPath, "images") + Path.DirectorySeparatorChar);
-           
-                string[] parts = processedCommand.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 2)
-                    return false;
-                
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string platformToolsPath = Path.Combine(baseDir, "platform-tools");
+                string workDir = Directory.Exists(platformToolsPath) ? platformToolsPath : baseDir;
 
-                List<string> args = new List<string>();
-                for (int i = 1; i < parts.Length; i++)
+                ProcessStartInfo startInfo = new ProcessStartInfo
                 {
-                    if (parts[i] == "||") break;
-                    args.Add(parts[i]);
-                }
-                
-                if (args.Count == 0) return false;
-                
-                string command = args[0];
-                string selectedSerial = GetSelectedDeviceSerial();
-                
-                // 多设备处理逻辑
-                string finalArguments = string.Join(" ", args);
-                if (!string.IsNullOrEmpty(selectedSerial))
-                {
-                    finalArguments = $"-s {selectedSerial} {finalArguments}";
-                }
-                
-                var processInfo = new ProcessStartInfo
-                {
-                    FileName = fastbootPath,
-                    Arguments = finalArguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
+                    FileName = "cmd.exe",
+                    Arguments = $"/k \"set PATH={workDir};%PATH% & title Yuzaki工具箱 - 命令行终端 & cd /d \"{workDir}\" & echo ======================================== & echo   欢迎使用 Yuzaki 工具箱 命令行终端 & echo   已自动配置 platform-tools 环境变量 & echo   可直接运行 adb 或 fastboot 命令 & echo ======================================== & echo.\"",
+                    UseShellExecute = true,
+                    WorkingDirectory = workDir
                 };
-                
-                bool isSending = false;
-                bool isWriting = false;
-                
-                using (var process = Process.Start(processInfo))
-                {
-                    if (process == null)
-                    {
-                        LogToFastboot("无法启动 fastboot 进程", "Red");
-                        return false;
-                    }
-
-                    StringBuilder outputBuilder = new StringBuilder();
-                    StringBuilder errorBuilder = new StringBuilder();
-                        
-                    // 实时读取标准输出
-                    process.OutputDataReceived += (sender, e) =>
-                    {
-                        if (!string.IsNullOrEmpty(e.Data))
-                        {
-                            outputBuilder.AppendLine(e.Data);
-                            fastbootCompleteLog.AppendLine($"[{DateTime.Now:HH:mm:ss}] [FASTBOOT OUTPUT] {e.Data}");
-                            Dispatcher.Invoke(() =>
-                            {
-                                ParseFastbootProgress(e.Data);
-                                if (trackDetailedPartitionStatus)
-                                {
-                                    ParseAndLogCustomStatus(e.Data, partitionName, ref isSending, ref isWriting, sourceFileName);
-                                }
-                            });
-                        }
-                    };
-                        
-                    // 实时读取标准错误
-                    process.ErrorDataReceived += (sender, e) =>
-                    {
-                        if (!string.IsNullOrEmpty(e.Data))
-                        {
-                            errorBuilder.AppendLine(e.Data);
-                            fastbootCompleteLog.AppendLine($"[{DateTime.Now:HH:mm:ss}] [FASTBOOT ERROR] {e.Data}");
-                            Dispatcher.Invoke(() =>
-                            {
-                                ParseFastbootProgress(e.Data);
-                                if (trackDetailedPartitionStatus)
-                                {
-                                    ParseAndLogCustomStatus(e.Data, partitionName, ref isSending, ref isWriting, sourceFileName);
-                                }
-                            });
-                        }
-                    };
-                        
-                    process.BeginOutputReadLine();
-                    process.BeginErrorReadLine();
-                        
-                    try
-                    {
-                        await process.WaitForExitAsync(cancellationToken);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        try
-                        {
-                            if (!process.HasExited)
-                            {
-                                process.Kill(entireProcessTree: true);
-                            }
-                        }
-                        catch
-                        {
-                        }
-                        throw;
-                    }
-                        
-                    string error = errorBuilder.ToString();
-                        
-                    if (process.ExitCode != 0)
-                    {
-                        LogFastbootNativeError(error, process.ExitCode);
-                        return false;
-                    }
-
-                    return true;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
+                Process.Start(startInfo);
             }
             catch (Exception ex)
             {
-                LogToFastboot($"执行fastboot命令失败: {ex.Message}", "Red");
-                return false;
+                ShowMessage($"启动命令行失败: {ex.Message}");
             }
         }
 
-        private string ApplyFastbootVerificationOptions(string commandLine, string partitionName)
+        private void Button_Click_1(object sender, RoutedEventArgs e)
         {
-            if (DisableDmVerityCheckBox?.IsChecked != true ||
-                !partitionName.StartsWith("vbmeta", StringComparison.OrdinalIgnoreCase))
+            try
             {
-                return commandLine;
-            }
-
-            return Regex.Replace(
-                commandLine,
-                @"^\s*fastboot(?:\s+%\*)?",
-                "fastboot --disable-verity --disable-verification",
-                RegexOptions.IgnoreCase);
-        }
-
-        // 处理分区名称，移除_ab后缀以显示实际分区名称
-        private string GetDisplayPartitionName(string partitionName)
-        {
-            if (string.IsNullOrEmpty(partitionName))
-                return partitionName;
-            if (partitionName.EndsWith("_ab", StringComparison.OrdinalIgnoreCase))
-            {
-                return partitionName.Substring(0, partitionName.Length - 3);
-            }
-            
-            return partitionName;
-        }
-
-        private string GetBasePartitionName(string partitionName)
-        {
-            if (string.IsNullOrEmpty(partitionName)) return partitionName;
-            if (partitionName.EndsWith("_a", StringComparison.OrdinalIgnoreCase) || partitionName.EndsWith("_b", StringComparison.OrdinalIgnoreCase))
-            {
-                return partitionName.Substring(0, partitionName.Length - 2);
-            }
-            if (partitionName.EndsWith("_ab", StringComparison.OrdinalIgnoreCase))
-            {
-                return partitionName.Substring(0, partitionName.Length - 3);
-            }
-            return partitionName;
-        }
-
-        private void ParseAndLogCustomStatus(string output, string partitionName, ref bool isSending, ref bool isWriting, string? sourceFileName = null)
-        {
-            if (string.IsNullOrEmpty(output)) return;
-            
-            string lowerOutput = output.ToLower();
-            
-            // 检测Sending命令开始
-            if (lowerOutput.Contains("sending") && lowerOutput.Contains("kb"))
-            {
-                if (!isSending)
+                if (sender is System.Windows.Controls.Button button)
                 {
-                    string sourceDisplayName = GetFastbootWriteSourceDisplayName(sourceFileName, partitionName);
-
-                    Dispatcher.Invoke(() =>
+                    string action = button.Content?.ToString() ?? "";
+                    if (action.Contains("开始检测"))
                     {
-                        if (!string.IsNullOrWhiteSpace(partitionName) &&
-                            partitionName.EndsWith("_ab", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string basePart = GetBasePartitionName(partitionName);
-                            string partA = $"{basePart}_a";
-                            string partB = $"{basePart}_b";
-
-                            foreach (string dest in new[] { partA, partB })
-                            {
-                                BeginFastbootPendingStep(_pendingFastbootFlashParagraphs, dest, BuildFastbootWriteStepTitle(sourceDisplayName, dest));
-                            }
-                        }
-                        else
-                        {
-                            string destPartition = partitionName ?? "--";
-                            BeginFastbootPendingStep(_pendingFastbootFlashParagraphs, destPartition, BuildFastbootWriteStepTitle(sourceDisplayName, destPartition));
-                        }
-
-                        FastbootLogTextBox.ScrollToEnd();
-                    });
-                    isSending = true;
-                }
-                return;
-            }
-            // 检测Writing命令开始
-            if (lowerOutput.Contains("writing"))
-            {
-                if (!isWriting)
-                {
-                    isWriting = true;
-                }
-                return;
-            }
-            
-            // 检测分区是否刷入成功
-            if (lowerOutput.Contains("flashed successfully"))
-            {
-                // 提取具体的分区名称
-                var match = System.Text.RegularExpressions.Regex.Match(output, @"Partition\s+([^\s]+)\s+flashed successfully", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                if (match.Success)
-                {
-                    string flashedPartition = match.Groups[1].Value;
-                    Dispatcher.Invoke(() =>
+                        HandleStartDeviceDetection();
+                    }
+                    else if (action.Contains("停止检测"))
                     {
-                        string sourceDisplayName = GetFastbootWriteSourceDisplayName(sourceFileName, partitionName);
-                        EndFastbootPendingStepOk(_pendingFastbootFlashParagraphs, flashedPartition, BuildFastbootWriteStepTitle(sourceDisplayName, flashedPartition));
-                    });
+                        HandleStopDeviceDetection();
+                    }
                 }
-                return;
             }
-            
-            // 检测完成信息
-            if (lowerOutput.Contains("finished") && lowerOutput.Contains("total time"))
+            catch (Exception ex)
             {
-                Dispatcher.Invoke(() =>
-                {
-                    CompleteFastbootPendingSteps(_pendingFastbootFlashParagraphs, true);
-                });
-                return;
-            }
-            
-            // 检测错误信息
-            if (lowerOutput.Contains("failed") || (lowerOutput.Contains("error") && !lowerOutput.Contains("fastboot error")))
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    CompleteFastbootPendingSteps(_pendingFastbootFlashParagraphs, false);
-                });
-                LogToFastboot($"错误: {output}", "Red");
-                return;
+                AddLogMessage("错误", $"按钮操作异常: {ex.Message}");
             }
         }
 
-        // 获取当前选中的设备序列号
+        private void BatteryControl_Loaded(object sender, RoutedEventArgs e) { }
+        private void LinkGuideTextBlock_MouseLeftButtonUp(object sender, MouseButtonEventArgs e) { }
+        private void ConnectionGuideTextBlock_MouseLeftButtonUp(object sender, MouseButtonEventArgs e) { }
+        private void UpdatePartitionButtonStates() { }
+        private void UpdateXiaomiScriptOnlyOptionsState() { }
         private string GetSelectedDeviceSerial()
         {
             return Dispatcher.Invoke(() =>
@@ -931,214 +1095,6 @@ namespace WpfApp1
                 }
                 return "";
             });
-        }
-
-        private bool isAllPartitionsSelected;
-        public bool IsAllPartitionsSelected
-        {
-            get { return isAllPartitionsSelected; }
-            set
-            {
-                if (isAllPartitionsSelected != value)
-                {
-                    isAllPartitionsSelected = value;
-                    OnPropertyChanged(nameof(IsAllPartitionsSelected));
-                }
-            }
-        }
-
-        public ICommand ToggleAllPartitionsCommand { get; }
-
-        public MainWindow()
-        {
-            // 初始化所有分区集合
-            allPartitions = new ObservableCollection<PartitionInfo>();
-            InitializeComponent();
-            allPartitions.CollectionChanged += AllPartitions_CollectionChanged;
-            UpdatePartitionSelectionSummary();
-            InitializeAutoRootModeUiState();
-            UpdateAvbModeFileInputs();
-            InitializeVioletDownload();
-            
-            // 屏幕适配逻辑
-            double screenHeight = SystemParameters.WorkArea.Height;
-            double screenWidth = SystemParameters.WorkArea.Width;
-            
-            // 目标设计尺寸
-            double targetWidth = 1000;
-            double targetHeight = 800;
-
-            // 如果屏幕空间不足（高度不足800或宽度不足1000），则按比例缩小窗口
-            if (screenHeight < targetHeight || screenWidth < targetWidth)
-            {
-                // 计算需要的缩放比例，取较小值以确保完全放入屏幕
-                // 留出一点边距（95%）
-                double ratioH = screenHeight / targetHeight;
-                double ratioW = screenWidth / targetWidth;
-                double ratio = Math.Min(ratioH, ratioW) * 0.95;
-
-                this.Width = targetWidth * ratio;
-                this.Height = targetHeight * ratio;
-            }
-            else
-            {
-                // 屏幕够大，使用标准尺寸
-                this.Width = targetWidth;
-                this.Height = targetHeight;
-            }
-            
-            // 确保窗口居中
-            this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            
-            // 异步增加打开次数
-            _ = TryIncrementOpenCountAsync();
-            
-            InitializeDeviceStatusMonitoring();
-            ToggleAllPartitionsCommand = new RelayCommand(ToggleAllPartitions);
-            
-            // 设置分区表容器
-            PartitionTableDataGrid.ItemsSource = allPartitions;
-            MultiDeviceComboBox.ItemsSource = DeviceSerials;
-            var appListDataGrid = this.FindName("AppListDataGrid") as DataGrid;
-            if (appListDataGrid != null)
-            {
-                appListDataGrid.ItemsSource = AppPackages;
-            }
-            
-            allPartitions.CollectionChanged += (s, e) =>
-            {
-                if (e.NewItems != null)
-                {
-                    foreach (PartitionInfo item in e.NewItems)
-                    {
-                        item.PropertyChanged += (sender, args) =>
-                        {
-                            if (args.PropertyName == nameof(PartitionInfo.IsSelected))
-                            {
-                                UpdateSelectAllState();
-                            }
-                        };
-                    }
-                }
-                UpdateSelectAllState();
-            };
-            InitializeAutorootPaths();
-
-            // 初始化时显示首页视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Visible;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-            
-            UpdateButtonStates("Home");
-            // 自动启动更新程序
-            StartUpdateProgram();
-            
-            
-            _storageViewModel = new StorageViewModel();
-            var storageBorder = this.FindName("StorageMemoryBorder") as Border;
-            if (storageBorder != null)
-            {
-                storageBorder.DataContext = _storageViewModel;
-            }
-            _storageTimer = new DispatcherTimer();
-            _storageTimer.Interval = TimeSpan.FromSeconds(10);
-            _storageTimer.Tick += async (s, e) => await RefreshStorageMemoryAsync(true);
-            _storageTimer.Start();
-            this.Loaded += async (s, e) => await RefreshStorageMemoryAsync();
-            this.Loaded += async (s, e) => await InitializeBroadcastNoticesAsync();
-            this.Loaded += MainWindow_Loaded;
-            this.Activated += (s, e) => ClearScrcpyWindowTopMost();
-            this.LocationChanged += (s, e) => UpdateScrcpyControlBarPosition();
-            this.SizeChanged += (s, e) => UpdateScrcpyControlBarPosition();
-            this.StateChanged += (s, e) =>
-            {
-                ClearScrcpyWindowTopMost();
-                UpdateScrcpyControlBarPosition();
-            };
-
-            InitializeLanguageUi();
-        }
-
-        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
-        {
-            var homeItem = this.FindName("HomeButton") as HandyControl.Controls.SideMenuItem;
-            
-            // 显示加载遮罩层
-            if (this.FindName("LoadingOverlay") is Grid loadingOverlay && this.FindName("LoadingContent") is Grid loadingContent)
-            {
-                loadingOverlay.Visibility = Visibility.Visible;
-                loadingContent.Visibility = Visibility.Visible;
-            }
-
-            // 解决 HandyControl 的异步加载延迟问题
-            Dispatcher.BeginInvoke(new Action(async () =>
-            {
-                // 等待 UI 完全稳定
-                await Task.Delay(200);
-
-                if (this.FindName("FlashFeatureGroup") is HandyControl.Controls.SideMenuItem flashItem)
-                {
-                    // 设置焦点并模拟鼠标左键点击
-                    flashItem.Focus();
-                    flashItem.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, 0, MouseButton.Left) { RoutedEvent = Mouse.MouseDownEvent });
-                    flashItem.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, 0, MouseButton.Left) { RoutedEvent = Mouse.MouseUpEvent });
-                }
-                
-                await Task.Delay(150); // 稍微加长等待动画开始的时间
-                
-                // 将焦点还给主页
-                if (homeItem != null)
-                {
-                    // 模拟点击主页，确保真正触发 SelectionChanged 逻辑
-                    homeItem.Focus();
-                    homeItem.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, 0, MouseButton.Left) { RoutedEvent = Mouse.MouseDownEvent });
-                    homeItem.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, 0, MouseButton.Left) { RoutedEvent = Mouse.MouseUpEvent });
-                    homeItem.IsSelected = true;
-                }
-                
-                // 再等一小会儿确保主页渲染完成
-                await Task.Delay(100);
-
-                // 隐藏加载遮罩层
-                if (this.FindName("LoadingOverlay") is Grid overlay && this.FindName("LoadingContent") is Grid content)
-                {
-                    overlay.Visibility = Visibility.Collapsed;
-                    content.Visibility = Visibility.Collapsed;
-                }
-                
-            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         }
 
         private static long ParseMemField(string text, string key)
@@ -1167,10 +1123,13 @@ namespace WpfApp1
                 string selectedSerial = GetSelectedDeviceSerial();
                 string serialArg = string.IsNullOrEmpty(selectedSerial) ? string.Empty : $"-s {selectedSerial} ";
 
+                // 1. 获取内存信息
                 var memTask = GetCommandOutput(adbPath, serialArg + "shell cat /proc/meminfo");
-                var dfhTask = GetCommandOutput(adbPath, serialArg + "shell df -h");
+                // 2. 优先以 1K 块精确查询 /data 分区使用情况（兼容所有 Android 版本）
+                var dfDataTask = GetCommandOutput(adbPath, serialArg + "shell df -k /data");
+
                 var mem = await memTask;
-                var dfh = await dfhTask;
+                var dfData = await dfDataTask;
 
                 if (!IsDeviceDetectionCycleCurrent(detectionVersion))
                 {
@@ -1185,83 +1144,111 @@ namespace WpfApp1
                     long cachedKb = ParseMemField(mem, "Cached");
                     availKb = freeKb + cachedKb;
                 }
-                double memTotalGb = totalKb > 0 ? totalKb / 1024.0 / 1024.0 : 0;
-                double memUsedPct = (totalKb > 0) ? 100.0 - (availKb * 1.0 / totalKb) * 100.0 : 0;
 
-                string targetLine = null;
-                foreach (var line in dfh.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    var lt = line.Trim();
-                    if (lt.EndsWith("/storage/emulated") || lt.Contains(" /storage/emulated "))
-                    {
-                        targetLine = lt;
-                        break;
-                    }
-                }
-                if (targetLine == null)
-                {
-                    foreach (var line in dfh.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        var lt = line.Trim();
-                        if (lt.EndsWith("/data") || lt.Contains(" /data "))
-                        {
-                            targetLine = lt;
-                            break;
-                        }
-                    }
-                }
-                if (targetLine == null)
-                {
-                    foreach (var line in dfh.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        var lt = line.Trim();
-                        if (lt.Contains("emulated"))
-                        {
-                            targetLine = lt;
-                            break;
-                        }
-                    }
-                }
+                double memTotalGb = totalKb > 0 ? (totalKb / 1024.0 / 1024.0) : 0;
+                double memUsedPct = (totalKb > 0) ? Math.Max(0, Math.Min(100, 100.0 - (availKb * 1.0 / totalKb) * 100.0)) : 0;
+
+                // 标称运存容量对齐（例如 10.8GB 内核实际对应 12GB 物理内存）
+                double nominalRam = memTotalGb;
+                if (memTotalGb >= 1.5 && memTotalGb <= 2.5) nominalRam = 2;
+                else if (memTotalGb > 2.5 && memTotalGb <= 3.5) nominalRam = 3;
+                else if (memTotalGb > 3.5 && memTotalGb <= 4.5) nominalRam = 4;
+                else if (memTotalGb > 4.5 && memTotalGb <= 6.5) nominalRam = 6;
+                else if (memTotalGb > 6.5 && memTotalGb <= 9.0) nominalRam = 8;
+                else if (memTotalGb > 9.0 && memTotalGb <= 13.0) nominalRam = 12;
+                else if (memTotalGb > 13.0 && memTotalGb <= 18.0) nominalRam = 16;
+                else if (memTotalGb > 18.0 && memTotalGb <= 26.0) nominalRam = 24;
+                else if (memTotalGb > 26.0 && memTotalGb <= 34.0) nominalRam = 32;
+
+                // 解析存储空间
                 double storageTotalGb = 0;
                 double storageUsedPct = 0;
-                if (!string.IsNullOrEmpty(targetLine))
+                bool parsedStorage = false;
+
+                if (!string.IsNullOrWhiteSpace(dfData))
                 {
-                    var tokens = Regex.Split(targetLine, "\\s+");
-                    if (tokens.Length >= 6)
+                    var lines = dfData.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
                     {
-                        var n = tokens.Length;
-                        var usePctToken = tokens[n - 2];
-                        var usedToken = tokens[n - 4];
-                        var sizeToken = tokens[n - 5];
+                        var lt = line.Trim();
+                        if (lt.StartsWith("Filesystem", StringComparison.OrdinalIgnoreCase)) continue;
 
-                        double ParseHumanGb(string t)
+                        var tokens = Regex.Split(lt, @"\s+");
+                        if (tokens.Length >= 4 && long.TryParse(tokens[1], out long total1k) && long.TryParse(tokens[2], out long used1k) && total1k > 0)
                         {
-                            t = t.Trim();
-                            if (string.IsNullOrEmpty(t)) return 0;
-                            var m = Regex.Match(t, "^([0-9]+(?:\\.[0-9]+)?)\\s*([KMGT])?", RegexOptions.IgnoreCase);
-                            if (!m.Success) return 0;
-                            var val = double.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
-                            var unit = m.Groups[2].Success ? m.Groups[2].Value.ToUpperInvariant() : "";
-                            return unit switch
+                            storageUsedPct = (used1k * 100.0) / total1k;
+                            // 十进制标称存储（例如 500,432,876 kB -> 512 GB）
+                            double decimalGb = (total1k * 1024.0) / 1e9;
+                            double nominalRom = decimalGb;
+                            if (decimalGb >= 14 && decimalGb <= 18) nominalRom = 16;
+                            else if (decimalGb > 18 && decimalGb <= 36) nominalRom = 32;
+                            else if (decimalGb > 36 && decimalGb <= 72) nominalRom = 64;
+                            else if (decimalGb > 72 && decimalGb <= 140) nominalRom = 128;
+                            else if (decimalGb > 140 && decimalGb <= 280) nominalRom = 256;
+                            else if (decimalGb > 280 && decimalGb <= 550) nominalRom = 512;
+                            else if (decimalGb > 550 && decimalGb <= 1100) nominalRom = 1024;
+                            else if (decimalGb > 1100 && decimalGb <= 2200) nominalRom = 2048;
+
+                            storageTotalGb = nominalRom;
+                            parsedStorage = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 备用 fallback: 查询 df -h 并解析
+                if (!parsedStorage)
+                {
+                    var dfh = await GetCommandOutput(adbPath, serialArg + "shell df -h");
+                    string? targetLine = null;
+                    foreach (var line in dfh.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var lt = line.Trim();
+                        if (lt.EndsWith("/data") || lt.EndsWith("/storage/emulated") || lt.Contains(" /data") || lt.Contains("emulated"))
+                        {
+                            targetLine = lt;
+                            break;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(targetLine))
+                    {
+                        var tokens = Regex.Split(targetLine, @"\s+");
+                        if (tokens.Length >= 6)
+                        {
+                            var n = tokens.Length;
+                            var usePctToken = tokens[n - 2];
+                            var usedToken = tokens[n - 4];
+                            var sizeToken = tokens[n - 5];
+
+                            double ParseHumanGb(string t)
                             {
-                                "T" => val * 1024.0,
-                                "G" => val,
-                                "M" => val / 1024.0,
-                                "K" => val / (1024.0 * 1024.0),
-                                _ => val
-                            };
-                        }
+                                t = t.Trim();
+                                if (string.IsNullOrEmpty(t)) return 0;
+                                var m = Regex.Match(t, @"^([0-9]+(?:\.[0-9]+)?)\s*([KMGT])?", RegexOptions.IgnoreCase);
+                                if (!m.Success) return 0;
+                                var val = double.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
+                                var unit = m.Groups[2].Success ? m.Groups[2].Value.ToUpperInvariant() : "";
+                                return unit switch
+                                {
+                                    "T" => val * 1024.0,
+                                    "G" => val,
+                                    "M" => val / 1024.0,
+                                    "K" => val / (1024.0 * 1024.0),
+                                    _ => val
+                                };
+                            }
 
-                        storageTotalGb = ParseHumanGb(sizeToken);
-                        var usedGb = ParseHumanGb(usedToken);
-                        var pctMatch = Regex.Match(usePctToken, @"^([0-9]+)\%$");
-                        if (pctMatch.Success)
-                        {
-                            storageUsedPct = double.Parse(pctMatch.Groups[1].Value, CultureInfo.InvariantCulture);
-                        }
-                        else if (storageTotalGb > 0)
-                        {
-                            storageUsedPct = usedGb / storageTotalGb * 100.0;
+                            storageTotalGb = ParseHumanGb(sizeToken);
+                            var usedGb = ParseHumanGb(usedToken);
+                            var pctMatch = Regex.Match(usePctToken, @"^([0-9]+)\%$");
+                            if (pctMatch.Success)
+                            {
+                                storageUsedPct = double.Parse(pctMatch.Groups[1].Value, CultureInfo.InvariantCulture);
+                            }
+                            else if (storageTotalGb > 0)
+                            {
+                                storageUsedPct = usedGb / storageTotalGb * 100.0;
+                            }
                         }
                     }
                 }
@@ -1273,9 +1260,9 @@ namespace WpfApp1
                         return;
                     }
 
-                    if (memTotalGb > 0)
+                    if (nominalRam > 0)
                     {
-                        _storageViewModel.SetTotalMemory(memTotalGb);
+                        _storageViewModel.SetTotalMemory(nominalRam);
                         _storageViewModel.MemoryUsage = Math.Max(0, Math.Min(100, memUsedPct));
                     }
                     if (storageTotalGb > 0)
@@ -1290,157 +1277,6 @@ namespace WpfApp1
             }
         }
 
-        private void ToggleAllPartitions(object parameter)
-        {
-            bool selectAll = parameter is bool ? (bool)parameter : IsAllPartitionsSelected;
-            bool adbMode = IsFastbootVisualizationAdbMode();
-            foreach (var partition in allPartitions)
-            {
-                partition.IsSelected = selectAll &&
-                                       !IsFastbootVisualizationPartitionProtected(partition.PartitionName, adbMode);
-            }
-            if (PartitionTableDataGrid.ItemsSource != null)
-            {
-                PartitionTableDataGrid.Items.Refresh();
-            }
-        }
-
-        private void UpdateSelectAllState()
-        {
-            bool adbMode = IsFastbootVisualizationAdbMode();
-            List<PartitionInfo> selectablePartitions = allPartitions
-                .Where(partition =>
-                    !IsFastbootVisualizationPartitionProtected(partition.PartitionName, adbMode))
-                .ToList();
-            IsAllPartitionsSelected = selectablePartitions.Any() &&
-                                      selectablePartitions.All(partition => partition.IsSelected);
-        }
-
-        private void AllPartitions_CollectionChanged(
-            object? sender,
-            System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
-        {
-            if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Reset)
-            {
-                foreach (PartitionInfo partition in _partitionSummarySubscriptions.ToArray())
-                {
-                    partition.PropertyChanged -= PartitionSummary_PropertyChanged;
-                }
-                _partitionSummarySubscriptions.Clear();
-
-                foreach (PartitionInfo partition in allPartitions)
-                {
-                    SubscribePartitionSummary(partition);
-                }
-            }
-            else
-            {
-                if (e.OldItems != null)
-                {
-                    foreach (PartitionInfo partition in e.OldItems.OfType<PartitionInfo>())
-                    {
-                        partition.PropertyChanged -= PartitionSummary_PropertyChanged;
-                        _partitionSummarySubscriptions.Remove(partition);
-                    }
-                }
-
-                if (e.NewItems != null)
-                {
-                    foreach (PartitionInfo partition in e.NewItems.OfType<PartitionInfo>())
-                    {
-                        SubscribePartitionSummary(partition);
-                    }
-                }
-            }
-
-            UpdatePartitionSelectionSummary();
-        }
-
-        private void SubscribePartitionSummary(PartitionInfo partition)
-        {
-            if (_partitionSummarySubscriptions.Add(partition))
-            {
-                partition.PropertyChanged += PartitionSummary_PropertyChanged;
-            }
-        }
-
-        private void PartitionSummary_PropertyChanged(
-            object? sender,
-            System.ComponentModel.PropertyChangedEventArgs e)
-        {
-            if (e.PropertyName == nameof(PartitionInfo.IsSelected) ||
-                e.PropertyName == nameof(PartitionInfo.PartitionSize) ||
-                e.PropertyName == nameof(PartitionInfo.FilePath))
-            {
-                UpdatePartitionSelectionSummary();
-            }
-        }
-
-        private void UpdatePartitionSelectionSummary()
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.BeginInvoke(UpdatePartitionSelectionSummary);
-                return;
-            }
-
-            if (PartitionSelectionSummaryTextBlock == null || allPartitions == null)
-            {
-                return;
-            }
-
-            List<PartitionInfo> selectedPartitions = allPartitions
-                .Where(partition => partition.IsSelected)
-                .ToList();
-            long totalBytes = 0;
-            bool allSizesKnown = true;
-
-            foreach (PartitionInfo partition in selectedPartitions)
-            {
-                long partitionBytes = 0;
-                bool sizeKnown = false;
-
-                if (!string.IsNullOrWhiteSpace(partition.FilePath) && File.Exists(partition.FilePath))
-                {
-                    try
-                    {
-                        partitionBytes = new FileInfo(partition.FilePath).Length;
-                        sizeKnown = partitionBytes > 0;
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                if (!sizeKnown &&
-                    !string.IsNullOrWhiteSpace(partition.PartitionSize) &&
-                    partition.PartitionSize != "--")
-                {
-                    partitionBytes = ParsePartitionSizeToBytes(partition.PartitionSize);
-                    sizeKnown = partitionBytes > 0;
-                }
-
-                if (!sizeKnown)
-                {
-                    allSizesKnown = false;
-                    continue;
-                }
-
-                totalBytes += partitionBytes;
-            }
-
-            string totalSizeText = selectedPartitions.Count == 0
-                ? "0 B"
-                : allSizesKnown
-                    ? FormatByteSize(totalBytes)
-                    : "--";
-            PartitionSelectionSummaryTextBlock.Text =
-                $"已选 {selectedPartitions.Count}/{allPartitions.Count} · {totalSizeText}";
-            PartitionSelectionSummaryTextBlock.Tag =
-                $"已选择 {selectedPartitions.Count} / {allPartitions.Count}  |  总计 {totalSizeText}";
-        }
-
-        // 强力线刷复选框选中事件处理器
         private void NavigateToUrl(object sender, MouseButtonEventArgs e)
         {
             try
@@ -1496,138 +1332,6 @@ namespace WpfApp1
                 len = len / 1024;
             }
             return $"{len:0.##} {sizes[order]}";
-        }
-
-        private async Task ErasePartitionsUsingAdb(
-            List<string> selectedPartitions,
-            System.Windows.Controls.RichTextBox logTextBox,
-            CancellationToken cancellationToken)
-        {
-            string adbPath = GetAdbPath();
-            if (string.IsNullOrEmpty(adbPath))
-            {
-                LogToFastboot("缺少adb.exe", "Red");
-                return;
-            }
-            
-            // 检查root权限
-            string suResult = await ExecuteAdbCommandWithOutput(
-                "shell su -c \"echo success\"",
-                cancellationToken);
-            if (!suResult.Contains("success"))
-            {
-                LogToFastboot("系统模式下擦除分区需ROOT,无法获取权限...", "Red");
-                return;
-            }
-            
-            LogToFastbootStyled(
-                ("准备擦除 ", "Black", false),
-                ($"{selectedPartitions.Count}", "Purple", true),
-                (" 个分区", "Black", false));
-
-            var eraseStopwatch = Stopwatch.StartNew();
-            int failedPartitionCount = 0;
-            
-            foreach (var partitionName in selectedPartitions)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                LogFastbootEraseBegin(partitionName);
-                
-                string partitionPath = $"/dev/block/bootdevice/by-name/{partitionName}";
-                
-                // 使用dd命令将零数据写入分区来擦除
-                string eraseCommand = $"shell su -c \"dd if=/dev/zero of={partitionPath} bs=4096 count=1024\"";
-                string result_erase = await ExecuteAdbCommandWithOutput(
-                    eraseCommand,
-                    CancellationToken.None);
-                
-                if (result_erase.Contains("error") || result_erase.Contains("failed") || result_erase.Contains("not found"))
-                {
-                    failedPartitionCount++;
-                    LogFastbootEraseEndFail(partitionName);
-                    if (!string.IsNullOrWhiteSpace(result_erase))
-                    {
-                        LogToFastboot(result_erase.Trim(), "Red");
-                    }
-                }
-                else
-                {
-                    LogFastbootEraseEndOk(partitionName);
-                }
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            long elapsedSeconds = Math.Max(0, (long)Math.Ceiling(eraseStopwatch.Elapsed.TotalSeconds));
-            LogToFastboot(
-                $"擦除完成，擦除失败分区{failedPartitionCount}个，耗时{elapsedSeconds}秒",
-                failedPartitionCount == 0 ? "Green" : "Orange");
-        }
-        
-        private async Task ErasePartitionsUsingFastboot(
-            List<string> selectedPartitions,
-            System.Windows.Controls.RichTextBox logTextBox,
-            CancellationToken cancellationToken)
-        {
-            try
-            {
-                string fastbootPath = GetFastbootPath();
-                if (string.IsNullOrEmpty(fastbootPath))
-                {
-                    LogToFastboot("缺少fastboot.exe", "Red");
-                    return;
-                }
-                
-                LogToFastbootStyled(
-                    ("准备擦除 ", "Black", false),
-                    ($"{selectedPartitions.Count}", "Purple", true),
-                    (" 个分区", "Black", false));
-
-                var eraseStopwatch = Stopwatch.StartNew();
-                int failedPartitionCount = 0;
-                
-                // 逐个擦除选中的分区
-                foreach (var partitionName in selectedPartitions)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    LogFastbootEraseBegin(partitionName);
-                    
-                    string eraseCommand = $"erase {partitionName}";
-                    string result_erase = await ExecuteFastbootCommand(
-                        fastbootPath,
-                        eraseCommand,
-                        cancellationToken: CancellationToken.None);
-                    
-                    if (result_erase.StartsWith("ERROR_DETECTED") ||
-                        result_erase.Contains("FAILED", StringComparison.OrdinalIgnoreCase) ||
-                        result_erase.Contains("error", StringComparison.OrdinalIgnoreCase))
-                    {
-                        failedPartitionCount++;
-                        LogFastbootEraseEndFail(partitionName);
-                        if (!string.IsNullOrWhiteSpace(result_erase))
-                        {
-                            LogToFastboot(result_erase.Trim(), "Red");
-                        }
-                    }
-                    else
-                    {
-                        LogFastbootEraseEndOk(partitionName);
-                    }
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
-                long elapsedSeconds = Math.Max(0, (long)Math.Ceiling(eraseStopwatch.Elapsed.TotalSeconds));
-                LogToFastboot(
-                    $"擦除完成，擦除失败分区{failedPartitionCount}个，耗时{elapsedSeconds}秒",
-                    failedPartitionCount == 0 ? "Green" : "Orange");
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                LogToFastboot($"擦除分区失败: {ex.Message}", "Red");
-            }
         }
 
         private void InitializeDeviceStatusMonitoring()
@@ -1687,127 +1391,9 @@ namespace WpfApp1
             }
         }
 
-        private async void CloseButton_Click(object sender, RoutedEventArgs e)
+        private void CloseButton_Click(object sender, RoutedEventArgs e)
         {
-            // 停止设备状态监控定时器
-            deviceStatusTimer?.Stop();
-            deviceStatusTimer = null;
-            
-            // 停止自动投屏定时器（如果存在）
-            StopAutoMirrorTimer();
-            
-            // 先隐藏主窗口
-            this.Hide();
-            
-            // 创建并显示独立的清理对话框
-            await ShowCleanupDialogAndExit();
-        }
-
-        private async Task ShowCleanupDialogAndExit()
-        {
-            Window? cleanupDialog = null;
-            
-            try
-            {
-                // 创建独立的清理对话框
-                cleanupDialog = new Window
-                {
-                    Title = "感谢使用紫罗兰工具箱",
-                    Width = 300,
-                    Height = 150,
-                    WindowStartupLocation = WindowStartupLocation.CenterScreen,
-                    ResizeMode = ResizeMode.NoResize,
-                    WindowStyle = WindowStyle.ToolWindow,
-                    Topmost = true,
-                    ShowInTaskbar = false,
-                    Content = new StackPanel
-                    {
-                        Margin = new Thickness(20),
-                        Children =
-                        {
-                            new TextBlock
-                            {
-                                Text = "正在清理工具痕迹，请稍等...",
-                                FontSize = 14,
-                                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
-                                Margin = new Thickness(0, 20, 0, 20)
-                            },
-                            new System.Windows.Controls.ProgressBar
-                            {
-                                IsIndeterminate = true,
-                                Height = 20,
-                                Margin = new Thickness(0, 10, 0, 0)
-                            }
-                        }
-                    }
-                };
-
-                cleanupDialog.Show();
-                
-                // 强制刷新UI，确保对话框显示
-                await Task.Delay(200);
-                
-                // 终止所有 adb.exe、fastboot.exe 和 scrcpy.exe 进程
-                await KillAllAdbAndFastbootProcesses();
-                
-                // 终止所有 scrcpy 相关进程
-                string[] scrcpyCommands = {
-                    "/f /im scrcpy.exe",
-                    "/f /im scrcpy-server.exe",
-                    "/f /im scrcpy*"
-                };
-                
-                foreach (string args in scrcpyCommands)
-                {
-                    try
-                    {
-                        ProcessStartInfo taskKillInfo = new ProcessStartInfo
-                        {
-                            FileName = "taskkill",
-                            Arguments = args,
-                            UseShellExecute = false,
-                            CreateNoWindow = true,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true
-                        };
-                        
-                        using (Process? taskKillProcess = Process.Start(taskKillInfo))
-                        {
-                            taskKillProcess?.WaitForExit(3000); // 等待最多3秒
-                        }
-                    }
-                    catch
-                    {
-                        // 忽略错误，继续执行
-                    }
-                }
-                
-                // 额外等待确保进程完全终止
-                await Task.Delay(1000);
-                
-                // 删除桌面上的Smart Tool Download文件夹
-                string downloadPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "Smart Tool Download");
-                if (System.IO.Directory.Exists(downloadPath))
-                {
-                    System.IO.Directory.Delete(downloadPath, true);
-                }
-                
-                // 短暂延迟以确保用户能看到清理过程
-                await Task.Delay(500);
-            }
-            catch (Exception ex)
-            {
-                // 如果删除失败，记录错误但不阻止程序关闭
-                System.Diagnostics.Debug.WriteLine($"关闭时清理失败: {ex.Message}");
-            }
-            finally
-            {
-                // 关闭清理对话框
-                cleanupDialog?.Close();
-                
-                // 确保应用程序完全退出
-                System.Windows.Application.Current.Shutdown();
-            }
+            this.Close();
         }
 
         private void MinimizeButton_Click(object sender, RoutedEventArgs e)
@@ -1815,2019 +1401,6 @@ namespace WpfApp1
             this.WindowState = WindowState.Minimized;
         }
 
-        private void HomeButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示主页视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Visible;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("Home");
-        }
-
-        private void ScreenMirrorButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示投屏视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Visible;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("ScreenMirror");
-        }
-
-        private void BasicFlashButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示基本刷入视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Visible;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("BasicFlash");
-        }
-
-        private void FastbootVisualizationButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示Fastboot可视化视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Visible;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("FastbootVisualization");
-
-            // 检查设备连接状态并更新分区操作按钮状态
-            UpdatePartitionButtonStates();
-        }
-
-        private void DownloadZoneButton_Click(object sender, RoutedEventArgs e)
-        {
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Visible;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            UpdateButtonStates("DownloadZone");
-
-            currentView = "DownloadZone";
-
-        }
-
-        private void VioletDownloadButton_Click(object sender, RoutedEventArgs e)
-        {
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Visible;
-
-            UpdateButtonStates("VioletDownload");
-            currentView = "VioletDownload";
-        }
-
-        private void AboutToolButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示关于工具视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Visible;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("AboutTool");
-
-        }
-
-        private void AutorootButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示一键ROOT视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Visible;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            EnsureAndRefreshAutorootTrafficUsage();
-
-            // 更新按钮状态
-            UpdateButtonStates("Autoroot");
-        }
-
-        // Autoroot功能事件处理方法
-        private void BtnSelectMagisk_Click(object sender, RoutedEventArgs e)
-        {
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = $"选择{GetAutoRootManagerInfo(GetSelectedAutoRootPatchScheme()).DisplayName}安装包",
-                Filter = "APK文件 (*.apk)|*.apk|所有文件 (*.*)|*.*",
-                FilterIndex = 1
-            };
-
-            if (openFileDialog.ShowDialog() == true)
-            {
-                var txtMagiskPath = this.FindName("txtMagiskPath") as System.Windows.Controls.TextBox;
-                if (txtMagiskPath != null)
-                {
-                    txtMagiskPath.Text = openFileDialog.FileName;
-                    magiskApkPath = openFileDialog.FileName;
-                }
-            }
-        }
-
-        private void BtnSelectBoot_Click(object sender, RoutedEventArgs e)
-        {
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = IsKernelPatchScheme(GetSelectedAutoRootPatchScheme())
-                    ? "选择boot镜像文件"
-                    : "选择Boot镜像文件",
-                Filter = "镜像文件 (*.img)|*.img|所有文件 (*.*)|*.*",
-                FilterIndex = 1
-            };
-
-            if (openFileDialog.ShowDialog() == true)
-            {
-                var txtBootPath = this.FindName("txtBootPath") as System.Windows.Controls.TextBox;
-                if (txtBootPath != null)
-                {
-                    txtBootPath.Text = openFileDialog.FileName;
-                    txtBootPath.Foreground = System.Windows.Media.Brushes.Black;
-                }
-            }
-        }
-
-        private void GkiSelectBootButton_Click(object sender, RoutedEventArgs e)
-        {
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择Boot镜像文件",
-                Filter = "镜像文件 (*.img)|*.img|所有文件 (*.*)|*.*",
-                FilterIndex = 1
-            };
-
-            if (openFileDialog.ShowDialog() == true)
-            {
-                var box = this.FindName("GkiBootPathTextBox") as System.Windows.Controls.TextBox;
-                if (box != null)
-                {
-                    box.Text = openFileDialog.FileName;
-                    box.Foreground = System.Windows.Media.Brushes.Black;
-                }
-            }
-        }
-
-        private void SelectAnykernel3Button_Click(object sender, RoutedEventArgs e)
-        {
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择AnyKernel3压缩包",
-                Filter = "ZIP文件 (*.zip)|*.zip|所有文件 (*.*)|*.*",
-                FilterIndex = 1
-            };
-
-            if (openFileDialog.ShowDialog() == true)
-            {
-                var box = this.FindName("GkiAk3PathTextBox") as System.Windows.Controls.TextBox;
-                if (box != null)
-                {
-                    box.Text = openFileDialog.FileName;
-                    box.Foreground = System.Windows.Media.Brushes.Black;
-                }
-            }
-        }
-
-        private async void GkiStartBuildButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var bootBox = this.FindName("GkiBootPathTextBox") as System.Windows.Controls.TextBox;
-                var ak3Box = this.FindName("GkiAk3PathTextBox") as System.Windows.Controls.TextBox;
-                if (bootBox == null || ak3Box == null)
-                {
-                    System.Windows.MessageBox.Show("缺少输入控件", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                var bootPath = bootBox.Text?.Trim() ?? string.Empty;
-                var ak3Path = ak3Box.Text?.Trim() ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(bootPath) || !File.Exists(bootPath))
-                {
-                    System.Windows.MessageBox.Show("请先选择有效的 Boot 镜像文件（文件名不限）", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                if (string.IsNullOrWhiteSpace(ak3Path) || !File.Exists(ak3Path))
-                {
-                    System.Windows.MessageBox.Show("请先选择有效的 AnyKernel3 压缩包", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-
-                AppendAutorootLog("开始GKI打包…", "yellow");
-                AppendAutorootLog($"boot: {bootPath}");
-                AppendAutorootLog($"ak3: {ak3Path}");
-
-                var appDir = AppDomain.CurrentDomain.BaseDirectory;
-                var magiskbootExe = System.IO.Path.Combine(appDir, "magiskboot.exe");
-                var gkiPatchBat = System.IO.Path.Combine(appDir, "GKIPatch.bat");
-                var sevenZExe = System.IO.Path.Combine(appDir, "bin", "7z.exe");
-                if (!File.Exists(magiskbootExe) || !File.Exists(gkiPatchBat) || !File.Exists(sevenZExe))
-                {
-                    System.Windows.MessageBox.Show("程序目录缺少必要文件", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    if (!File.Exists(magiskbootExe)) AppendAutorootLog($"缺少文件: {magiskbootExe}", "red");
-                    if (!File.Exists(gkiPatchBat)) AppendAutorootLog($"缺少文件: {gkiPatchBat}", "red");
-                    if (!File.Exists(sevenZExe)) AppendAutorootLog($"缺少文件: {sevenZExe}", "red");
-                    return;
-                }
-
-                var desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                var outputDir = System.IO.Path.Combine(desktop, "SmartTool_GKI");
-                // Each build owns its directory; stale images/kernels must not be reused.
-                var workDir = System.IO.Path.Combine(outputDir, "build-" + Guid.NewGuid().ToString("N"));
-                Directory.CreateDirectory(workDir);
-                AppendAutorootLog($"工作目录: {workDir}");
-
-                // Normalize only the working copy, not the user's selected file.
-                var bootCopy = System.IO.Path.Combine(workDir, "boot.img");
-                var ak3Copy = System.IO.Path.Combine(workDir, "AnyKernel3.zip");
-                File.Copy(bootPath, bootCopy, true);
-                File.Copy(ak3Path, ak3Copy, true);
-                AppendAutorootLog("已复制输入文件到工作目录");
-
-                var magiskbootCopy = System.IO.Path.Combine(workDir, System.IO.Path.GetFileName(magiskbootExe));
-                var gkiPatchCopy = System.IO.Path.Combine(workDir, System.IO.Path.GetFileName(gkiPatchBat));
-                File.Copy(magiskbootExe, magiskbootCopy, true);
-                File.Copy(gkiPatchBat, gkiPatchCopy, true);
-                AppendAutorootLog("已复制工具文件到工作目录");
-
-                var extractedDir = System.IO.Path.Combine(workDir, "AK3");
-                Directory.CreateDirectory(extractedDir);
-                AppendAutorootLog("开始解压AnyKernel3压缩包…");
-
-                var psi7z = new ProcessStartInfo
-                {
-                    FileName = sevenZExe,
-                    Arguments = $"x \"{ak3Copy}\" -o\"{extractedDir}\" -y",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = workDir
-                };
-                using (var p7z = Process.Start(psi7z))
-                {
-                    if (p7z == null) throw new InvalidOperationException("无法启动 7-Zip");
-                    {
-                        var outTask = Task.Run(async () =>
-                        {
-                            while (true)
-                            {
-                                var line = await p7z.StandardOutput.ReadLineAsync();
-                                if (line == null) break;
-                                AppendAutorootLog($"[7z] {line}");
-                            }
-                        });
-                        var errTask = Task.Run(async () =>
-                        {
-                            while (true)
-                            {
-                                var line = await p7z.StandardError.ReadLineAsync();
-                                if (line == null) break;
-                                AppendAutorootLog($"[7z] {line}");
-                            }
-                        });
-                        await Task.WhenAll(outTask, errTask);
-                        await p7z.WaitForExitAsync();
-                        if (p7z.ExitCode != 0)
-                            throw new InvalidOperationException($"AnyKernel3 解压失败，退出码: {p7z.ExitCode}");
-                    }
-                }
-                AppendAutorootLog("解压完成");
-
-                var bootInAk3 = System.IO.Path.Combine(extractedDir, System.IO.Path.GetFileName(bootCopy));
-                var magiskInAk3 = System.IO.Path.Combine(extractedDir, System.IO.Path.GetFileName(magiskbootCopy));
-                var patchInAk3 = System.IO.Path.Combine(extractedDir, System.IO.Path.GetFileName(gkiPatchCopy));
-                File.Copy(bootCopy, bootInAk3, true);
-                File.Copy(magiskbootCopy, magiskInAk3, true);
-                File.Copy(gkiPatchCopy, patchInAk3, true);
-                AppendAutorootLog("已复制文件到AK3目录");
-
-                var psiBat = new ProcessStartInfo
-                {
-                    FileName = "cmd.exe",
-                    Arguments = "/d /c GKIPatch.bat boot.img",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    RedirectStandardInput = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = extractedDir
-                };
-                AppendAutorootLog("开始运行GKIPatch脚本…");
-                using (var pBat = Process.Start(psiBat))
-                {
-                    if (pBat == null) throw new InvalidOperationException("无法启动 GKIPatch");
-                    // An error-path PAUSE in the batch must not wait for invisible input.
-                    pBat.StandardInput.Close();
-                    {
-                        var outTask = Task.Run(async () =>
-                        {
-                            while (true)
-                            {
-                                var line = await pBat.StandardOutput.ReadLineAsync();
-                                if (line == null) break;
-                                AppendAutorootLog($"[GKIPatch] {line}");
-                            }
-                        });
-                        var errTask = Task.Run(async () =>
-                        {
-                            while (true)
-                            {
-                                var line = await pBat.StandardError.ReadLineAsync();
-                                if (line == null) break;
-                                AppendAutorootLog($"[GKIPatch] {line}");
-                            }
-                        });
-                        await Task.WhenAll(outTask, errTask);
-                        await pBat.WaitForExitAsync();
-                        if (pBat.ExitCode != 0)
-                            throw new InvalidOperationException($"GKIPatch 打包失败，退出码: {pBat.ExitCode}");
-                    }
-                }
-                AppendAutorootLog("脚本执行完成");
-
-                var newBoot = System.IO.Path.Combine(extractedDir, "boot-new.img");
-                if (!File.Exists(newBoot) || new FileInfo(newBoot).Length == 0)
-                {
-                    System.Windows.MessageBox.Show("未生成新镜像", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    AppendAutorootLog("未生成新镜像", "red");
-                    return;
-                }
-
-                var finalBoot = System.IO.Path.Combine(outputDir, "boot-new.img");
-                File.Copy(newBoot, finalBoot, true);
-                AppendAutorootLog($"已生成: {finalBoot}", "green");
-
-                // Remove only this build's generated directory, never other output/user files.
-                try
-                {
-                    Directory.Delete(workDir, true);
-                    AppendAutorootLog("清理完成");
-                }
-                catch (Exception cleanupError)
-                {
-                    AppendAutorootLog($"镜像已生成，临时目录清理失败: {cleanupError.Message}", "yellow");
-                }
-
-                try
-                {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "explorer.exe",
-                        Arguments = $"\"{outputDir}\"",
-                        UseShellExecute = true
-                    });
-                }
-                catch { }
-                AppendAutorootLog("已打开输出目录", "green");
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"错误: {ex.Message}", "red");
-            }
-        }
-
-        private async Task RunOfflinePatchAsync()
-        {
-            if (AutoFlashAndInstallCheckBox?.IsChecked == true)
-            {
-                await RunOfflinePatchAutoFlashAsync();
-                return;
-            }
-
-            var txtBootPath = this.FindName("txtBootPath") as System.Windows.Controls.TextBox;
-            var txtMagiskPath = this.FindName("txtMagiskPath") as System.Windows.Controls.TextBox;
-            var startButton = btnAutoRoot;
-            object? originalButtonContent = startButton?.Content;
-            string patchScheme = GetSelectedAutoRootPatchScheme();
-            bool isAlpha = string.Equals(patchScheme, "Alpha", StringComparison.OrdinalIgnoreCase);
-            bool isKernelPatch = IsKernelPatchScheme(patchScheme);
-
-            // 验证输入
-            if (string.IsNullOrWhiteSpace(txtBootPath?.Text) ||
-                txtBootPath.Text == "请选择你的boot.img文件路径:" ||
-                txtBootPath.Text == OfflineBootFileHint ||
-                txtBootPath.Text == KernelPatchBootFileHint)
-            {
-                System.Windows.MessageBox.Show(
-                    isKernelPatch ? "请先选择 boot.img 文件..." : "请先选择 init_boot 或 boot 文件...",
-                    "错误",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                return;
-            }
-
-            string selectedManagerPath = txtMagiskPath?.Text?.Trim() ?? string.Empty;
-            bool downloadManager = string.IsNullOrWhiteSpace(selectedManagerPath) ||
-                                   selectedManagerPath == OfflineManagerFileHint;
-
-            if (!File.Exists(txtBootPath.Text))
-            {
-                System.Windows.MessageBox.Show("Boot文件不存在...", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            if ((isAlpha || isKernelPatch) && !downloadManager && !File.Exists(selectedManagerPath))
-            {
-                System.Windows.MessageBox.Show("管理器安装包不存在...", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            try
-            {
-                EnsureKernelPatchBootImage(txtBootPath.Text, patchScheme);
-            }
-            catch (Exception ex)
-            {
-                System.Windows.MessageBox.Show(ex.Message, patchScheme, MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            // 检测boot文件名称是否包含特殊符号（括号或空格）
-            string bootFileName = IOPath.GetFileName(txtBootPath.Text);
-            if (isAlpha && (bootFileName.Contains("(") || bootFileName.Contains(")") || bootFileName.Contains(" ")))
-            {
-                AppendAutorootLog("检测到boot文件名称存在特殊符号，请修改文件名称重试...", "red");
-                return;
-            }
-
-            if (isAlpha)
-            {
-                InitializeAutorootPaths();
-            }
-
-            // 禁用按钮防止重复点击
-            if (startButton != null)
-            {
-                startButton.IsEnabled = false;
-                startButton.Content = "修补中...";
-            }
-            SetPatchSchemeSelectionEnabled(false);
-
-            string? managerWorkDirectory = null;
-            string? managerTmpRoot = null;
-            bool createdManagerTmpRoot = false;
-
-            // 开始修补过程
-            try
-            {
-                string bootPath = txtBootPath.Text;
-                string magiskPath = selectedManagerPath;
-                if (isAlpha && downloadManager)
-                {
-                    string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-                    managerTmpRoot = IOPath.Combine(desktop, "VioletTmp");
-                    createdManagerTmpRoot = !Directory.Exists(managerTmpRoot);
-                    managerWorkDirectory = IOPath.Combine(managerTmpRoot, "OfflinePatch_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
-                    Directory.CreateDirectory(managerWorkDirectory);
-                    var manager = GetAutoRootManagerInfo(patchScheme);
-                    magiskPath = IOPath.Combine(managerWorkDirectory, manager.FileName);
-                    AppendAutorootLog($"未选择管理器安装包，开始下载 {manager.DisplayName}...", "yellow");
-                    await DownloadAutoRootFileAsync(
-                        manager.DownloadUrl,
-                        magiskPath,
-                        0,
-                        20,
-                        System.Threading.CancellationToken.None);
-                    AppendAutorootLog($"{manager.DisplayName} 下载完成", "green");
-                }
-                // 修改输出路径为桌面，统一输出到桌面
-                string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                string suffix = isAlpha
-                    ? "_patched"
-                    : string.Equals(patchScheme, "APatch", StringComparison.OrdinalIgnoreCase)
-                        ? "_apatch_patched"
-                        : string.Equals(patchScheme, "FolkPatch", StringComparison.OrdinalIgnoreCase)
-                            ? "_folkpatch_patched"
-                            : string.Equals(patchScheme, "ReSukiSU LKM", StringComparison.OrdinalIgnoreCase)
-                        ? "_resukisu_lkm_patched"
-                        : string.Equals(patchScheme, "SukiSU LKM", StringComparison.OrdinalIgnoreCase)
-                            ? "_sukisu_lkm_patched"
-                            : "_kernelsu_lkm_patched";
-                string outputPath = IOPath.Combine(
-                    desktopPath,
-                    IOPath.GetFileNameWithoutExtension(bootPath) + suffix + IOPath.GetExtension(bootPath));
-
-                bool success;
-                if (isAlpha)
-                {
-                    success = await ExecuteMagiskPatchAsync(bootPath, outputPath, magiskPath);
-                }
-                else if (isKernelPatch)
-                {
-                    await ExecuteKernelPatchAsync(
-                        bootPath,
-                        outputPath,
-                        patchScheme,
-                        System.Threading.CancellationToken.None);
-                    success = true;
-                }
-                else
-                {
-                    string kmi = await ResolveOfflineLkmKmiAsync(
-                        System.Threading.CancellationToken.None);
-                    await ExecuteLkmPatchAsync(
-                        bootPath,
-                        outputPath,
-                        patchScheme,
-                        kmi,
-                        System.Threading.CancellationToken.None);
-                    success = true;
-                }
-
-                if (success)
-                {
-                    // 修补成功，不弹出成功窗口，只在日志中记录
-                    AppendAutorootLog($"修补成功...输出文件：{outputPath}");
-                }
-                else
-                {
-                    System.Windows.MessageBox.Show("修补失败...请检查文件和路径是否正确。", "错误", 
-                        MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"{patchScheme} 修补失败: {ex.Message}", "red");
-                System.Windows.MessageBox.Show($"修补过程中发生错误：{ex.Message}", "错误", 
-                    MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-            finally
-            {
-                if (!string.IsNullOrWhiteSpace(managerWorkDirectory) &&
-                    !string.IsNullOrWhiteSpace(managerTmpRoot))
-                {
-                    TryCleanupAutoRootDirectory(managerWorkDirectory, managerTmpRoot, createdManagerTmpRoot);
-                    if (txtMagiskPath != null) txtMagiskPath.Text = OfflineManagerFileHint;
-                }
-
-                // 恢复按钮状态
-                if (startButton != null)
-                {
-                    startButton.IsEnabled = true;
-                    startButton.Content = originalButtonContent;
-                }
-                SetPatchSchemeSelectionEnabled(true);
-            }
-        }
-
-        private async void BtnAutoRoot_Click(object sender, RoutedEventArgs e)
-        {
-            if (OnePlusAutoRootModeRadioButton?.IsChecked == true)
-            {
-                await RunOnePlusAutoRootAsync();
-                return;
-            }
-
-            await RunOfflinePatchAsync();
-        }
-
-        private async Task<bool> CheckDeviceConnection()
-        {
-            try
-            {
-                string adbPath = GetAdbPath();
-                
-                var process = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = adbPath,
-                        Arguments = "devices",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                process.Start();
-                string output = await process.StandardOutput.ReadToEndAsync();
-                await process.WaitForExitAsync();
-
-                // 检查是否有设备连接
-                var lines = output.Split('\n');
-                foreach (var line in lines)
-                {
-                    if (line.Contains("device") && !line.Contains("List of devices"))
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private async Task<string> GetKernelVersion()
-        {
-            try
-            {
-                string adbPath = GetAdbPath();
-                var process = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = adbPath,
-                        Arguments = "shell uname -r",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                process.Start();
-                string output = await process.StandardOutput.ReadToEndAsync();
-                await process.WaitForExitAsync();
-
-                return output.Trim();
-            }
-            catch
-            {
-                return string.Empty;
-            }
-        }
-
-        private string DetermineFileType(string kernelVersion)
-        {
-            try
-            {
-                // 解析内核版本号
-                var match = Regex.Match(kernelVersion, @"(\d+)\.(\d+)\.(\d+)");
-                if (match.Success)
-                {
-                    int major = int.Parse(match.Groups[1].Value);
-                    int minor = int.Parse(match.Groups[2].Value);
-                    int patch = int.Parse(match.Groups[3].Value);
-
-                    // 5.4内核比较特殊，需要通过修补boot.img来获取root权限
-                    if (major == 5 && minor == 4)
-                    {
-                        return "boot.img";
-                    }
-                    // 5.10及以下版本的内核需要修补boot.img获得root权限
-                    else if (major < 5 || (major == 5 && minor <= 10))
-                    {
-                        return "boot.img";
-                    }
-                    // 5.15及以上的内核版本通过修补initboot来获取root权限
-                    else if (major > 5 || (major == 5 && minor >= 15))
-                    {
-                        return "initboot";
-                    }
-                }
-                
-                // 默认返回boot.img
-                return "boot.img";
-            }
-            catch
-            {
-                return "boot.img";
-            }
-        }
-
-        private async Task WaitForPatchCompletion()
-        {
-            // 这里需要监控修补过程的完成状态
-            // 可以通过检查日志或者文件状态来判断
-            await Task.Delay(5000); // 临时等待5秒
-        }
-
-        private async Task MovePatchedFileToDesktop(string desktopPath, string fileType)
-        {
-            try
-            {
-                // 检查桌面是否已经存在修补后的文件
-                string expectedFileName = GetPatchedFileName(fileType);
-                string desktopFilePath = IOPath.Combine(desktopPath, expectedFileName);
-                
-                if (IOFile.Exists(desktopFilePath))
-                {
-                    AppendAutorootLog($"修补文件已存在于桌面: {expectedFileName}");
-                    return;
-                }
-                
-                // 如果桌面没有文件，则在程序目录中搜索
-                string sourcePattern = fileType == "boot.img" ? "*boot*patched*.img" : "*init*boot*patched*.img";
-                string[] files = Directory.GetFiles(Environment.CurrentDirectory, sourcePattern, SearchOption.AllDirectories);
-                
-                if (files.Length > 0)
-                {
-                    string sourceFile = files[0];
-                    IOFile.Copy(sourceFile, desktopFilePath, true);
-                    AppendAutorootLog($"修补文件已移动到桌面: {expectedFileName}");
-                }
-                else
-                {
-                    // 尝试更宽泛的搜索模式
-                    string[] allImgFiles = Directory.GetFiles(Environment.CurrentDirectory, "*.img", SearchOption.AllDirectories);
-                    var patchedFiles = allImgFiles.Where(f => 
-                        IOPath.GetFileName(f).ToLower().Contains("patch") && 
-                        (IOPath.GetFileName(f).ToLower().Contains("boot") || IOPath.GetFileName(f).ToLower().Contains("init"))
-                    ).ToArray();
-                    
-                    if (patchedFiles.Length > 0)
-                    {
-                        string sourceFile = patchedFiles[0];
-                        IOFile.Copy(sourceFile, desktopFilePath, true);
-                        AppendAutorootLog($"修补文件已移动到桌面: {expectedFileName}");
-                    }
-                    else
-                    {
-                        AppendAutorootLog("在程序目录中未找到修补后的文件，但修补过程可能已直接保存到桌面");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"处理修补文件时出错: {ex.Message}");
-            }
-        }
-
-        private string GetPatchedFileName(string fileType)
-        {
-            return fileType == "boot.img" ? "boot_patched.img" : "init_boot_patched.img";
-        }
-
-        private async Task RebootToFastboot()
-        {
-            try
-            {
-                string adbPath = GetAdbPath();
-                
-                // 检测chkFastbootD复选框状态，决定使用哪个重启命令
-                string rebootCommand = "reboot bootloader"; // 默认命令
-                if (chkFastbootD.IsChecked == true)
-                {
-                    rebootCommand = "reboot fastboot";
-                    AppendAutorootLog("检测到FastbootD模式已选择，使用 'adb reboot fastboot' 命令");
-                }
-                else
-                {
-                    AppendAutorootLog("使用标准Fastboot模式，使用 'adb reboot bootloader' 命令");
-                }
-                
-                var process = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = adbPath,
-                        Arguments = rebootCommand,
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                process.Start();
-                await process.WaitForExitAsync();
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"重启到fastboot失败: {ex.Message}");
-            }
-        }
-
-        private async Task<bool> WaitForFastbootDevice()
-        {
-            int maxAttempts = 60; // 3分钟，每3秒检查一次
-            int attempts = 0;
-
-            while (attempts < maxAttempts)
-            {
-                try
-                {
-                    string fastbootPath = GetFastbootPath();
-                    var process = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = fastbootPath,
-                            Arguments = "devices",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            CreateNoWindow = true
-                        }
-                    };
-
-                    process.Start();
-                    string output = await process.StandardOutput.ReadToEndAsync();
-                    await process.WaitForExitAsync();
-
-                    if (!string.IsNullOrWhiteSpace(output) && output.Contains("fastboot"))
-                    {
-                        return true;
-                    }
-                }
-                catch
-                {
-                    // 忽略错误，继续尝试
-                }
-
-                await Task.Delay(3000); // 等待3秒
-                attempts++;
-            }
-
-            return false;
-        }
-
-        private async Task<bool> WaitForFastbootDeviceWithCountdown(
-            string fastbootPath,
-            int timeoutSeconds,
-            CancellationToken cancellationToken = default)
-        {
-            if (string.IsNullOrWhiteSpace(fastbootPath) || timeoutSeconds <= 0)
-            {
-                return false;
-            }
-
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var firstCheckProcess = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = fastbootPath,
-                        Arguments = "devices",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                firstCheckProcess.Start();
-                Task<string> firstOutputTask = firstCheckProcess.StandardOutput.ReadToEndAsync();
-                await firstCheckProcess.WaitForExitAsync(cancellationToken);
-                string firstOutput = await firstOutputTask;
-
-                if (!string.IsNullOrWhiteSpace(firstOutput) && firstOutput.Contains("fastboot", StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-            }
-
-            Paragraph countdownParagraph = null;
-            Run countdownRun = null;
-
-            Dispatcher.Invoke(() =>
-            {
-                countdownParagraph = new Paragraph { Margin = new Thickness(0) };
-                countdownRun = new Run();
-                countdownParagraph.Inlines.Add(countdownRun);
-                FastbootLogTextBox.Document.Blocks.Add(countdownParagraph);
-                FastbootLogTextBox.ScrollToEnd();
-            });
-
-            try
-            {
-                for (int remaining = timeoutSeconds; remaining >= 1; remaining--)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    Dispatcher.Invoke(() =>
-                    {
-                        if (countdownRun != null)
-                        {
-                            countdownRun.Text = $"[{DateTime.Now:HH:mm:ss}] 等待设备...{remaining}s";
-                        }
-                    });
-
-                    try
-                    {
-                        var process = new Process
-                        {
-                            StartInfo = new ProcessStartInfo
-                            {
-                                FileName = fastbootPath,
-                                Arguments = "devices",
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true,
-                                RedirectStandardError = true,
-                                CreateNoWindow = true
-                            }
-                        };
-
-                        process.Start();
-                        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-                        await process.WaitForExitAsync(cancellationToken);
-                        string output = await outputTask;
-
-                        if (!string.IsNullOrWhiteSpace(output) && output.Contains("fastboot", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return true;
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch
-                    {
-                    }
-
-                    await Task.Delay(1000, cancellationToken);
-                }
-
-                return false;
-            }
-            finally
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    try
-                    {
-                        if (countdownParagraph != null)
-                        {
-                            FastbootLogTextBox.Document.Blocks.Remove(countdownParagraph);
-                        }
-                    }
-                    catch
-                    {
-                    }
-                });
-            }
-        }
-
-        private async Task<bool> FlashPatchedFile(string fileType, string filePath)
-        {
-            try
-            {
-                string partition = fileType == "boot.img" ? "boot" : "init_boot";
-                string fastbootPath = GetFastbootPath();
-                
-                var process = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = fastbootPath,
-                        Arguments = $"flash {partition} \"{filePath}\"",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                process.Start();
-                string output = await process.StandardOutput.ReadToEndAsync();
-                string error = await process.StandardError.ReadToEndAsync();
-                await process.WaitForExitAsync();
-
-                return process.ExitCode == 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private async Task RebootDevice()
-        {
-            try
-            {
-                string fastbootPath = GetFastbootPath();
-                var process = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = fastbootPath,
-                        Arguments = "reboot",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    }
-                };
-
-                process.Start();
-                await process.WaitForExitAsync();
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"重启设备失败: {ex.Message}");
-            }
-        }
-
-        private async Task KillFastbootProcesses()
-        {
-            try
-            {
-                var processes = Process.GetProcessesByName("fastboot");
-                foreach (var process in processes)
-                {
-                    try
-                    {
-                        process.Kill();
-                        await process.WaitForExitAsync();
-                    }
-                    catch
-                    {
-                        // 忽略无法结束的进程
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"结束fastboot进程失败: {ex.Message}");
-            }
-        }
-
-        private void BtnClearLog_Click(object sender, RoutedEventArgs e)
-        {
-            var txtLog = this.FindName("txtLog") as System.Windows.Controls.RichTextBox;
-            if (txtLog != null)
-            {
-                txtLog.Document.Blocks.Clear();
-                AppendAutorootLog("日志已清空");
-            }
-        }
-
-        private void AvbSelectBootButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbBootPathTextBox, "boot 镜像");
-        }
-
-        private void AvbSelectInitBootButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbInitBootPathTextBox, "boot/init_boot 镜像");
-        }
-
-        private void AvbSelectVbmetaButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbVbmetaPathTextBox, "vbmeta 镜像");
-        }
-
-        private void AvbSelectAospVbmetaButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbAospVbmetaPathTextBox, "vbmeta 镜像");
-        }
-
-        private void AvbSelectAospBootButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbAospBootPathTextBox, "boot 镜像");
-        }
-
-        private void AvbSelectAospRecoveryButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbAospRecoveryPathTextBox, "recovery 镜像");
-        }
-
-        private void AvbSelectAospVbmetaSystemButton_Click(object sender, RoutedEventArgs e)
-        {
-            SelectAvbImageFile(AvbAospVbmetaSystemPathTextBox, "vbmeta_system 镜像");
-        }
-
-        private void AvbModeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            UpdateAvbModeFileInputs();
-        }
-
-        private async void AvbAnalyzeVbmetaButton_Click(object sender, RoutedEventArgs e)
-        {
-            const string Vbmeta117PublicKeySha256 =
-                "7728e30f50bfa5cea165f473175a08803f6a8346642b5aa10913e9d9e6defef6";
-            const string Vbmeta229PublicKeySha256 =
-                "7b34b55104c8f0f48ae3763b1b20990aa9f8f5f0dffb838d7e31ef506c819281";
-
-            var dialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择需要分析的 vbmeta.img",
-                Filter = "vbmeta 镜像 (vbmeta*.img)|vbmeta*.img|Android 镜像 (*.img)|*.img|所有文件 (*.*)|*.*",
-                CheckFileExists = true,
-                Multiselect = false,
-                FileName = "vbmeta.img"
-            };
-            if (dialog.ShowDialog() != true)
-            {
-                return;
-            }
-
-            var vbmetaPath = dialog.FileName;
-
-            AvbAnalyzeVbmetaButton.IsEnabled = false;
-            try
-            {
-                var rebuilder = new NativeAvbRebuilder(AppendAutorootLog);
-                var profile = await Task.Run(() => rebuilder.AnalyzePublicKeys(vbmetaPath));
-                AppendAutorootLog(
-                    $"vbmeta 主公钥: RSA-{profile.MainKey.KeyBits}, SHA-256: {profile.MainKey.Sha256}");
-
-                if (profile.ChainKeys.TryGetValue("vbmeta_system", out var vbmetaSystemKey))
-                {
-                    AppendAutorootLog(
-                        $"vbmeta_system 链式公钥: RSA-{vbmetaSystemKey.KeyBits}, SHA-256: {vbmetaSystemKey.Sha256}");
-                }
-
-                if (string.Equals(
-                    profile.MainKey.Sha256,
-                    Vbmeta117PublicKeySha256,
-                    StringComparison.OrdinalIgnoreCase))
-                {
-                    AppendAvbAnalysisResult("该版本可使用旧方案", true);
-                }
-                else if (string.Equals(
-                    profile.MainKey.Sha256,
-                    Vbmeta229PublicKeySha256,
-                    StringComparison.OrdinalIgnoreCase))
-                {
-                    AppendAvbAnalysisResult("请先使用改回AOSP签名+旧版本abl", false);
-                }
-                else
-                {
-                    AppendAutorootLog("未知的公钥，无法识别", "yellow");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"vbmeta 分析失败: {ex.Message}", "red");
-            }
-            finally
-            {
-                AvbAnalyzeVbmetaButton.IsEnabled = true;
-            }
-        }
-
-        private void AppendAvbAnalysisResult(string message, bool oldSchemeAvailable)
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(() => AppendAvbAnalysisResult(message, oldSchemeAvailable));
-                return;
-            }
-
-            var richTextBox = this.FindName("txtLog") as System.Windows.Controls.RichTextBox;
-            if (richTextBox == null) return;
-
-            var accentColor = oldSchemeAvailable
-                ? System.Windows.Media.Color.FromRgb(22, 163, 74)
-                : System.Windows.Media.Color.FromRgb(217, 119, 6);
-            var paragraph = new System.Windows.Documents.Paragraph
-            {
-                Margin = new System.Windows.Thickness(0, 1, 0, 1),
-                LineHeight = 19
-            };
-            paragraph.Inlines.Add(new System.Windows.Documents.Run($"{DateTime.Now:HH:mm:ss}")
-            {
-                Foreground = new System.Windows.Media.SolidColorBrush(
-                    System.Windows.Media.Color.FromRgb(148, 163, 184)),
-                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
-                FontSize = 11,
-            });
-            paragraph.Inlines.Add(new System.Windows.Documents.Run("    "));
-            paragraph.Inlines.Add(new System.Windows.Documents.Run(message)
-            {
-                Foreground = new System.Windows.Media.SolidColorBrush(accentColor),
-                FontWeight = FontWeights.Bold
-            });
-
-            richTextBox.Document.Blocks.Add(paragraph);
-            richTextBox.ScrollToEnd();
-        }
-
-        private async void AvbStartSignButton_Click(object sender, RoutedEventArgs e)
-        {
-            await RunAvbRebuildToolAsync();
-        }
-
-        private async Task RunAvbRebuildToolAsync()
-        {
-            var isChainedMode = IsAvbChainedMode();
-            var isNewAospMode = IsAvbNewAospMode();
-            var selection = isNewAospMode
-                ? ResolveAvbNewAospSelection()
-                : ResolveAvbSelection(isChainedMode);
-            if (selection == null)
-            {
-                return;
-            }
-
-            var avbRoot = ResolveAvbToolRoot();
-            if (string.IsNullOrWhiteSpace(avbRoot))
-            {
-                AppendAutorootLog("未找到AVB私钥目录", "red");
-                System.Windows.MessageBox.Show("未找到AVB私钥目录，请确认程序目录或项目根目录存在 avbtool\\tools\\pem。", "AVB签名", MessageBoxButton.OK, MessageBoxImage.Error);
-                return;
-            }
-
-            if (!Directory.Exists(Path.Combine(avbRoot, "tools", "pem")))
-            {
-                AppendAutorootLog($"AVB私钥目录不完整: {avbRoot}", "red");
-                return;
-            }
-
-            var startButton = this.FindName("AvbStartSignButton") as System.Windows.Controls.Button;
-            if (startButton != null) startButton.IsEnabled = false;
-
-            try
-            {
-                var rebuilder = new NativeAvbRebuilder(AppendAutorootLog);
-                var outputSelection = await Task.Run(() => CreateAvbOutputSelection(selection));
-                AppendAutorootLog($"签名输出目录: {outputSelection.OutputDirectory}", "green");
-                AppendAutorootLog("开始自动验证AVB镜像...", "yellow");
-                await Task.Run(() => rebuilder.Verify(outputSelection.VbmetaPath, outputSelection.PartitionImages));
-
-                const bool useOriginalSalt = true;
-                const int keySelection = 0;
-                AppendAutorootLog("开始执行AVB签名...", "yellow");
-                if (isNewAospMode)
-                {
-                    await Task.Run(() => rebuilder.RebuildAospChain(
-                        outputSelection.PartitionImages,
-                        outputSelection.VbmetaPath!,
-                        avbRoot));
-                }
-                else
-                {
-                    await Task.Run(() => rebuilder.Rebuild(
-                        outputSelection.PartitionImages,
-                        outputSelection.VbmetaPath,
-                        avbRoot,
-                        useOriginalSalt,
-                        isChainedMode,
-                        keySelection));
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"AVB执行失败: {ex.Message}", "red");
-            }
-            finally
-            {
-                if (startButton != null) startButton.IsEnabled = true;
-            }
-        }
-
-        private static AvbOutputSelection CreateAvbOutputSelection(AvbSelection selection)
-        {
-            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-            if (string.IsNullOrWhiteSpace(desktop))
-            {
-                throw new DirectoryNotFoundException("无法获取桌面目录。");
-            }
-
-            var outputDirectory = Path.Combine(
-                desktop,
-                "VioletToolAVB_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture));
-            Directory.CreateDirectory(outputDirectory);
-
-            var outputPartitions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in selection.PartitionImages)
-            {
-                var outputPath = Path.Combine(
-                    outputDirectory,
-                    "VioletAVB_" + Path.GetFileName(item.Value));
-                CopyAvbSourceToOutput(item.Value, outputPath);
-                outputPartitions[item.Key] = outputPath;
-            }
-
-            string? outputVbmetaPath = null;
-            if (!string.IsNullOrWhiteSpace(selection.VbmetaPath))
-            {
-                outputVbmetaPath = Path.Combine(
-                    outputDirectory,
-                    "VioletAVB_" + Path.GetFileName(selection.VbmetaPath));
-                CopyAvbSourceToOutput(selection.VbmetaPath, outputVbmetaPath);
-            }
-
-            return new AvbOutputSelection(outputPartitions, outputVbmetaPath, outputDirectory);
-        }
-
-        private static void CopyAvbSourceToOutput(string sourcePath, string outputPath)
-        {
-            var fullSourcePath = Path.GetFullPath(sourcePath);
-            var fullOutputPath = Path.GetFullPath(outputPath);
-            if (string.Equals(fullSourcePath, fullOutputPath, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    $"请选择 VioletToolAVB 目录外的原始镜像: {Path.GetFileName(sourcePath)}");
-            }
-
-            File.Copy(fullSourcePath, fullOutputPath, true);
-        }
-
-        private void SelectAvbImageFile(System.Windows.Controls.TextBox target, string displayName)
-        {
-            var dialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = $"选择 {displayName}",
-                Filter = "Android镜像 (*.img)|*.img|所有文件 (*.*)|*.*",
-                CheckFileExists = true
-            };
-
-            if (dialog.ShowDialog() == true)
-            {
-                target.Text = dialog.FileName;
-                AppendAutorootLog($"已选择 {displayName}: {dialog.FileName}", "green");
-            }
-        }
-
-        private AvbSelection? ResolveAvbSelection(bool isChainedMode)
-        {
-            if (isChainedMode)
-            {
-                var bootPath = AvbBootPathTextBox?.Text?.Trim() ?? string.Empty;
-                if (!ValidateAvbSelectedFile(bootPath, "boot 镜像")) return null;
-
-                var rebuilder = new NativeAvbRebuilder(AppendAutorootLog);
-                var partitionName = rebuilder.DetectPartitionName(bootPath, new[] { "boot" }, "boot");
-                AppendAutorootLog($"识别目标分区: {partitionName}", "green");
-                return new AvbSelection(
-                    new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                    {
-                        [partitionName] = bootPath
-                    },
-                    null);
-            }
-
-            var targetPath = AvbInitBootPathTextBox?.Text?.Trim() ?? string.Empty;
-            var vbmetaPath = AvbVbmetaPathTextBox?.Text?.Trim() ?? string.Empty;
-            if (!ValidateAvbSelectedFile(targetPath, "boot/init_boot 镜像")) return null;
-            if (!ValidateAvbSelectedFile(vbmetaPath, "vbmeta 镜像")) return null;
-
-            var detector = new NativeAvbRebuilder(AppendAutorootLog);
-            var fallbackPartition = Path.GetFileNameWithoutExtension(targetPath)
-                .Contains("init_boot", StringComparison.OrdinalIgnoreCase)
-                ? "init_boot"
-                : "boot";
-            var detectedPartition = detector.DetectPartitionName(
-                targetPath,
-                new[] { "boot", "init_boot" },
-                fallbackPartition);
-            AppendAutorootLog($"识别目标分区: {detectedPartition}", "green");
-
-            return new AvbSelection(
-                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [detectedPartition] = targetPath
-                },
-                vbmetaPath);
-        }
-
-        private AvbSelection? ResolveAvbNewAospSelection()
-        {
-            var vbmetaPath = AvbAospVbmetaPathTextBox?.Text?.Trim() ?? string.Empty;
-            var bootPath = AvbAospBootPathTextBox?.Text?.Trim() ?? string.Empty;
-            var recoveryPath = AvbAospRecoveryPathTextBox?.Text?.Trim() ?? string.Empty;
-            var vbmetaSystemPath = AvbAospVbmetaSystemPathTextBox?.Text?.Trim() ?? string.Empty;
-
-            if (!ValidateAvbSelectedFile(vbmetaPath, "vbmeta 镜像")) return null;
-            if (!ValidateAvbSelectedFile(bootPath, "boot 镜像")) return null;
-            if (!ValidateAvbSelectedFile(recoveryPath, "recovery 镜像")) return null;
-            if (!ValidateAvbSelectedFile(vbmetaSystemPath, "vbmeta_system 镜像")) return null;
-
-            return new AvbSelection(
-                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["boot"] = bootPath,
-                    ["recovery"] = recoveryPath,
-                    ["vbmeta_system"] = vbmetaSystemPath
-                },
-                vbmetaPath);
-        }
-
-        private bool ValidateAvbSelectedFile(string path, string displayName)
-        {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            {
-                System.Windows.MessageBox.Show($"请先选择 {displayName}。", "AVB签名", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return false;
-            }
-
-            return true;
-        }
-
-        private bool IsAvbChainedMode()
-        {
-            return (AvbModeComboBox?.SelectedIndex ?? 0) == 1;
-        }
-
-        private bool IsAvbNewAospMode()
-        {
-            return (AvbModeComboBox?.SelectedIndex ?? 0) == 2;
-        }
-
-        private void UpdateAvbModeFileInputs()
-        {
-            var isChainedMode = IsAvbChainedMode();
-            var isNewAospMode = IsAvbNewAospMode();
-            if (AvbChainedFilePanel != null)
-            {
-                AvbChainedFilePanel.Visibility = isChainedMode && !isNewAospMode
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
-            }
-
-            if (AvbNonChainedFilePanel != null)
-            {
-                AvbNonChainedFilePanel.Visibility = !isChainedMode && !isNewAospMode
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
-            }
-
-            if (AvbNewAospFilePanel != null)
-            {
-                AvbNewAospFilePanel.Visibility = isNewAospMode
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
-            }
-
-        }
-
-        private sealed record AvbSelection(
-            IReadOnlyDictionary<string, string> PartitionImages,
-            string? VbmetaPath);
-
-        private sealed record AvbOutputSelection(
-            IReadOnlyDictionary<string, string> PartitionImages,
-            string? VbmetaPath,
-            string OutputDirectory);
-
-        private string ResolveAvbToolRoot()
-        {
-            var candidates = new List<string>();
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            candidates.Add(Path.Combine(baseDir, "avbtool"));
-
-            var dir = new DirectoryInfo(baseDir);
-            for (var i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
-            {
-                candidates.Add(Path.Combine(dir.FullName, "avbtool"));
-            }
-
-            return candidates
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault(x => File.Exists(Path.Combine(x, "tools", "pem", "testkey_rsa4096.pem")) &&
-                                     File.Exists(Path.Combine(x, "tools", "pem", "testkey_rsa2048.pem"))) ?? string.Empty;
-        }
-
-        private void LinkTutorial_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "https://violettool.top/",
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"打开教程链接失败: {ex.Message}", "red");
-            }
-        }
-
-        private void UploadWebsiteLink_RequestNavigate(object sender, System.Windows.Navigation.RequestNavigateEventArgs e)
-        {
-            try
-            {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = e.Uri.AbsoluteUri,
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                AddLogMessage("下载专区", $"打开链接失败: {ex.Message}");
-            }
-            finally
-            {
-                e.Handled = true;
-            }
-        }
-
-        // 复选框事件处理方法
-        private void ChkFastboot_Checked(object sender, RoutedEventArgs e)
-        {
-            // chkFastboot选中时，取消chkFastbootD的选中状态
-            var chkFastbootD = this.FindName("chkFastbootD") as System.Windows.Controls.CheckBox;
-            if (chkFastbootD != null)
-            {
-                chkFastbootD.IsChecked = false;
-            }
-            AppendAutorootLog("已选择Fastboot模式", "yellow");
-        }
-
-        private void ChkFastboot_Unchecked(object sender, RoutedEventArgs e)
-        {
-            // 可以在这里添加取消选中的逻辑
-        }
-
-        private void ChkFastbootD_Checked(object sender, RoutedEventArgs e)
-        {
-            // chkFastbootD选中时，取消chkFastboot的选中状态
-            var chkFastboot = this.FindName("chkFastboot") as System.Windows.Controls.CheckBox;
-            if (chkFastboot != null)
-            {
-                chkFastboot.IsChecked = false;
-            }
-            AppendAutorootLog("已选择FastbootD模式", "yellow");
-        }
-
-        private void ChkFastbootD_Unchecked(object sender, RoutedEventArgs e)
-        {
-            // 可以在这里添加取消选中的逻辑
-        }
-
-        private async void SystemZoneButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示系统专区视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Visible;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("SystemZone");
-
-            // 本次程序运行中只在首次打开文件传输页时读取默认内部存储。
-            // 先置位可避免 SideMenu 的多个事件重复触发并发加载。
-            if (!_hasAutoLoadedSystemZoneDirectory)
-            {
-                _hasAutoLoadedSystemZoneDirectory = true;
-                await LoadFileListFromPath("/sdcard/");
-            }
-        }
-
-
-        private void UpdateButtonStates(string activeView)
-        {
-            CurrentView = activeView;
-            currentView = activeView;
-        }
-
-        private void AppManagementButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示应用管理视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Visible;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("AppManagement");
-
-            // 更新当前界面状态
-            currentView = "AppManagement";
-
-        }
-
-        private void AndroidGeneralButton_Click(object sender, RoutedEventArgs e)
-        {
-            // 显示安卓常用视图，隐藏其他视图
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Visible;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Collapsed;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            // 更新按钮状态
-            UpdateButtonStates("AndroidGeneral");
-
-            // 更新当前界面状态
-            currentView = "AndroidGeneral";
-
-        }
-
-        private void EdlFlashButton_Click(object sender, RoutedEventArgs e)
-        {
-            var homeView = this.FindName("HomeView") as Grid;
-            var screenMirrorView = this.FindName("ScreenMirrorView") as Grid;
-            var basicFlashView = this.FindName("BasicFlashView") as Grid;
-            var fastbootVisualizationView = this.FindName("FastbootVisualizationView") as Grid;
-            var hiddenEnvironmentView = this.FindName("HiddenEnvironmentView") as Grid;
-            var downloadView = this.FindName("DownloadView") as Grid;
-            var aboutToolView = this.FindName("AboutToolView") as Grid;
-            var systemZoneView = this.FindName("SystemZoneView") as Grid;
-            var oujiaFlashView = this.FindName("OujiaFlashView") as Grid;
-            var autorootView = this.FindName("AutorootView") as Grid;
-            var appManagementView = this.FindName("AppManagementView") as Grid;
-            var androidGeneralView = this.FindName("AndroidGeneralView") as Grid;
-            var payloadView = this.FindName("PayloadView") as Grid;
-            var romDownloadView = this.FindName("RomDownloadview") as Grid;
-            var edlFlashView = this.FindName("EdlFlashView") as Grid;
-            var colorOSAssistantView = this.FindName("ColorOSAssistantView") as Grid;
-            var backupAssistantView = this.FindName("BackupAssistantView") as Grid;
-            var violetDownloadView = this.FindName("VioletDownloadView") as Grid;
-
-            if (homeView != null) homeView.Visibility = Visibility.Collapsed;
-            if (screenMirrorView != null) screenMirrorView.Visibility = Visibility.Collapsed;
-            if (basicFlashView != null) basicFlashView.Visibility = Visibility.Collapsed;
-            if (fastbootVisualizationView != null) fastbootVisualizationView.Visibility = Visibility.Collapsed;
-            if (hiddenEnvironmentView != null) hiddenEnvironmentView.Visibility = Visibility.Collapsed;
-            if (downloadView != null) downloadView.Visibility = Visibility.Collapsed;
-            if (aboutToolView != null) aboutToolView.Visibility = Visibility.Collapsed;
-            if (systemZoneView != null) systemZoneView.Visibility = Visibility.Collapsed;
-            if (oujiaFlashView != null) oujiaFlashView.Visibility = Visibility.Collapsed;
-            if (autorootView != null) autorootView.Visibility = Visibility.Collapsed;
-            if (appManagementView != null) appManagementView.Visibility = Visibility.Collapsed;
-            if (androidGeneralView != null) androidGeneralView.Visibility = Visibility.Collapsed;
-            if (payloadView != null) payloadView.Visibility = Visibility.Collapsed;
-            if (romDownloadView != null) romDownloadView.Visibility = Visibility.Collapsed;
-            if (edlFlashView != null) edlFlashView.Visibility = Visibility.Visible;
-            if (colorOSAssistantView != null) colorOSAssistantView.Visibility = Visibility.Collapsed;
-            if (backupAssistantView != null) backupAssistantView.Visibility = Visibility.Collapsed;
-            if (violetDownloadView != null) violetDownloadView.Visibility = Visibility.Collapsed;
-
-            UpdateButtonStates("EdlFlash");
-            currentView = "EdlFlash";
-            Dispatcher.BeginInvoke(
-                new Action(StartEdlCloudLoaderRefresh),
-                System.Windows.Threading.DispatcherPriority.Background);
-        }
-
-        // 读取应用列表按钮点击事件：执行 adb shell pm list packages 并填充可勾选列表
         private async void ReadAppListButton_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -4784,128 +2357,6 @@ namespace WpfApp1
             catch (Exception ex)
             {
                 AppendAppManagementLog($"复制包名失败: {ex.Message}");
-            }
-        }
-        
-        // 根据设备连接状态更新分区操作按钮状态
-        private void UpdatePartitionButtonStates()
-        {
-            var readPartitionButton = this.FindName("ReadPartitionButton") as System.Windows.Controls.Button;
-            var backupBasebandButton = this.FindName("BackupBasebandButton") as System.Windows.Controls.Button;
-            var backupGptButton = this.FindName("BackupGptButton") as System.Windows.Controls.Button;
-            
-            if (readPartitionButton != null && backupBasebandButton != null && backupGptButton != null)
-            {
-                bool adbMode = string.Equals(
-                    BottomConnectionTypeText?.Text,
-                    "系统",
-                    StringComparison.OrdinalIgnoreCase);
-                readPartitionButton.IsEnabled = adbMode;
-                backupBasebandButton.IsEnabled = adbMode;
-                backupGptButton.IsEnabled = adbMode;
-            }
-        }
-
-        private void PartitionSearchComboBox_KeyUp(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            var comboBox = sender as System.Windows.Controls.ComboBox;
-            if (comboBox == null || allPartitions == null) return;
-
-            var searchText = comboBox.Text;
-            if (string.IsNullOrWhiteSpace(searchText))
-            {
-                comboBox.ItemsSource = null;
-                comboBox.IsDropDownOpen = false;
-                return;
-            }
-
-            var filteredPartitions = allPartitions.Where(p => 
-                p.PartitionName.IndexOf(searchText, System.StringComparison.OrdinalIgnoreCase) >= 0
-            ).ToList();
-
-            if (filteredPartitions.Any())
-            {
-                comboBox.ItemsSource = filteredPartitions;
-                comboBox.IsDropDownOpen = true;
-            }
-            else
-            {
-                comboBox.ItemsSource = null;
-                comboBox.IsDropDownOpen = false;
-            }
-        }
-
-        private void PartitionSearchComboBox_PreviewTextInput(object sender, System.Windows.Input.TextCompositionEventArgs e)
-        {
-            // 允许文本输入
-        }
-
-        private void PartitionSearchComboBox_DropDownOpened(object sender, System.EventArgs e)
-        {
-            var comboBox = sender as System.Windows.Controls.ComboBox;
-            if (comboBox == null || allPartitions == null) return;
-
-            // 如果没有搜索文本，显示所有分区
-            if (string.IsNullOrWhiteSpace(comboBox.Text))
-            {
-                comboBox.ItemsSource = allPartitions.ToList();
-            }
-        }
-
-        private void PartitionSearchComboBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-        {
-            var comboBox = sender as System.Windows.Controls.ComboBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as System.Windows.Controls.DataGrid;
-            
-            if (comboBox?.SelectedItem is PartitionInfo selectedPartition && dataGrid != null)
-            {
-                // 找到选中的分区在DataGrid容器中的位置
-                if (dataGrid.ItemsSource is System.Collections.ObjectModel.ObservableCollection<PartitionInfo> partitions)
-                {
-                    var targetPartition = partitions.FirstOrDefault(p => p.PartitionName == selectedPartition.PartitionName);
-                    if (targetPartition != null)
-                    {
-                        // 跳转到选中的行
-                        dataGrid.SelectedItem = targetPartition;
-                        dataGrid.ScrollIntoView(targetPartition);
-                        
-                        // 自动勾选此分区
-                        targetPartition.IsSelected = true;
-                        
-                        // 清空搜索框
-                        comboBox.Text = "";
-                        comboBox.SelectedItem = null;
-                        comboBox.IsDropDownOpen = false;
-                    }
-                }
-            }
-        }
-
-        private void PartitionSearchTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            if (sender is not System.Windows.Controls.TextBox searchTextBox ||
-                PartitionTableDataGrid?.ItemsSource == null)
-            {
-                return;
-            }
-
-            string keyword = searchTextBox.Text.Trim();
-            ICollectionView view = CollectionViewSource.GetDefaultView(PartitionTableDataGrid.ItemsSource);
-            view.Filter = string.IsNullOrWhiteSpace(keyword)
-                ? null
-                : item => item is PartitionInfo partition &&
-                          partition.PartitionName.Contains(keyword, StringComparison.OrdinalIgnoreCase);
-            view.Refresh();
-        }
-
-        private void PartitionSearchTextBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (e.Key == System.Windows.Input.Key.Escape &&
-                sender is System.Windows.Controls.TextBox searchTextBox &&
-                !string.IsNullOrEmpty(searchTextBox.Text))
-            {
-                searchTextBox.Clear();
-                e.Handled = true;
             }
         }
 
@@ -5985,7 +3436,7 @@ namespace WpfApp1
                     string arguments = await BuildScrcpyLaunchArgumentsAsync(selectedSerial, bitrate, maxFps, maxSize);
                     string scrcpyWindowTitle = !string.IsNullOrWhiteSpace(selectedSerial)
                         ? await BuildScrcpyWindowTitleAsync(selectedSerial)
-                        : "紫罗兰工具箱";
+                        : "Yuzaki工具箱";
                     
                     ProcessStartInfo startInfo = new ProcessStartInfo
                     {
@@ -6010,22 +3461,10 @@ namespace WpfApp1
                         AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] 命令: {scrcpyPath} {arguments}\n");
                         
                         // 异步读取标准输出
-                        scrcpyProcess.OutputDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrEmpty(e.Data))
-                            {
-                                AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] {e.Data}\n");
-                            }
-                        };
+                        scrcpyProcess.OutputDataReceived += (sender, e) => ProcessScrcpyLogLine(e.Data, false);
                         
                         // 异步读取错误输出
-                        scrcpyProcess.ErrorDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrEmpty(e.Data))
-                            {
-                                AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] ERROR: {e.Data}\n");
-                            }
-                        };
+                        scrcpyProcess.ErrorDataReceived += (sender, e) => ProcessScrcpyLogLine(e.Data, true);
                         
                         // 开始异步读取
                         scrcpyProcess.BeginOutputReadLine();
@@ -6146,7 +3585,7 @@ namespace WpfApp1
 
             if (titleParts.Count == 0)
             {
-                titleParts.Add("紫罗兰工具箱");
+                titleParts.Add("Yuzaki工具箱");
             }
 
             string title = string.Join("_", titleParts);
@@ -6163,6 +3602,25 @@ namespace WpfApp1
                 nameof(MirrorTitleShowDeviceCodeCheckBox) => $"代号{value}",
                 _ => value
             };
+        }
+
+        private void ProcessScrcpyLogLine(string? line, bool isError = false)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            string prefix = isError ? "ERROR: " : "";
+            AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] [scrcpy] {prefix}{line}\n");
+
+            if (line.Contains("injectInputEvent") || line.Contains("injectInputEventToTarget") ||
+                line.Contains("SecurityException") || (line.Contains("InvocationTargetException") && line.Contains("InputManager")))
+            {
+                AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] --------------------------------------------------\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] 【投屏触控被拦截排查提示】检测到事件注入被手机系统拦截！\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] 原因：小米/HyperOS/MIUI 设备未开启模拟点击权限。\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] 解决方案：\n" +
+                    $"[{DateTime.Now:HH:mm:ss}]  1. 手机进入【开发者选项】-> 开启【USB 调试（安全设置）】；\n" +
+                    $"[{DateTime.Now:HH:mm:ss}]  2. 或在投屏设置中勾选【仅投屏不控制】即可免权限流畅投屏。\n" +
+                    $"[{DateTime.Now:HH:mm:ss}] --------------------------------------------------\n");
+            }
         }
 
         private async Task<string> BuildScrcpyLaunchArgumentsAsync(string? selectedSerial, int bitrate, int maxFps, int maxSize)
@@ -6194,6 +3652,11 @@ namespace WpfApp1
 
                 arguments.Add($"--window-width {customWidth}");
                 arguments.Add($"--window-height {customHeight}");
+            }
+
+            if (MirrorNoControlCheckBox?.IsChecked == true)
+            {
+                arguments.Add("--no-control");
             }
 
             if (MirrorClipboardSyncCheckBox?.IsChecked != true)
@@ -6514,85 +3977,6 @@ namespace WpfApp1
             }
             catch
             {
-            }
-        }
-
-
-        private async void AndroidDriverButton_Click(object sender, RoutedEventArgs e)
-        {
-            string url = "https://wwim.lanzouo.com/iUb8G32pxaaj";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
-        private async void MTKDriverButton_Click(object sender, RoutedEventArgs e)
-        {
-            string url = "https://wwim.lanzouo.com/iMrQe32px92f";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
-        private async void QualcommDriverButton_Click(object sender, RoutedEventArgs e)
-        {
-            string url = "https://wwim.lanzouo.com/iOpKy32px8sf";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
-        private async void LibUSBDriverButton_Click(object sender, RoutedEventArgs e)
-        {
-            string url = "https://wwim.lanzouo.com/iBeCq32px8tg";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
-        private async void OPPODriverButton_Click(object sender, RoutedEventArgs e)
-        {
-            string url = "https://wwim.lanzouo.com/iFmMh32px9wf";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
-        private void CmdButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                string platformToolsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools");
-                string cmdBatPath = Path.Combine(platformToolsPath, "CMD.bat");
-                
-                if (File.Exists(cmdBatPath))
-                {
-                    ProcessStartInfo startInfo = new ProcessStartInfo
-                    {
-                        FileName = cmdBatPath,
-                        UseShellExecute = true,
-                        WorkingDirectory = platformToolsPath
-                    };
-                    Process.Start(startInfo);
-                }
-                else
-                {
-                    ShowMessage($"未找到CMD.bat文件: {cmdBatPath}");
-                }
-            }
-            catch (Exception ex)
-            {
-                ShowMessage($"打开CMD失败: {ex.Message}");
             }
         }
 
@@ -6955,452 +4339,6 @@ namespace WpfApp1
             }
         }
 
-        private async void GenerateOcdtButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                GenerateOcdtButton.IsEnabled = false;
-                SuperPackLogRichTextBox.Document.Blocks.Clear();
-                AppendOcdtLog("开始生成 OCDT 文件...");
-
-                // 收集参数
-                string projIdText = OcdtProjIdTextBox.Text.Trim();
-                if (string.IsNullOrEmpty(projIdText) || !int.TryParse(projIdText, out int projId))
-                {
-                    AppendOcdtLog("错误：请输入有效的数字 Project ID", System.Windows.Media.Brushes.Red);
-                    return;
-                }
-
-                string platform = ((ComboBoxItem)OcdtSizeComboBox.SelectedItem).Content.ToString();
-                string size = platform == "联发科" ? "8mb" : "128kb";
-                string variant = ((ComboBoxItem)OcdtVariantComboBox.SelectedItem).Content.ToString();
-
-                // 弹出文件夹选择对话框让用户选择保存的目录
-                using (var folderDialog = new System.Windows.Forms.FolderBrowserDialog())
-                {
-                    folderDialog.Description = "请选择保存生成的 OCDT 镜像的目录";
-                    if (folderDialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
-                    {
-                        AppendOcdtLog("已取消生成。");
-                        return;
-                    }
-
-                    // 在用户选择的目录下创建 violettoolbox_ocdt 文件夹
-                    string saveDir = Path.Combine(folderDialog.SelectedPath, "violettoolbox_ocdt");
-                    if (!Directory.Exists(saveDir))
-                    {
-                        Directory.CreateDirectory(saveDir);
-                    }
-
-                    string outputPath = Path.Combine(saveDir, $"violet_ocdt_{projId}_{size}.img");
-
-                    await Task.Run(() =>
-                    {
-                        if (size == "8mb")
-                        {
-                            Generate8MbOcdt(projId, outputPath, variant, null, null);
-                        }
-                        else
-                        {
-                            Generate128KbOcdt(projId, outputPath, variant, null, null);
-                        }
-                        
-                        Dispatcher.Invoke(() => AppendOcdtLog($"已生成: {outputPath}", System.Windows.Media.Brushes.Green));
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendOcdtLog($"发生异常：{ex.Message}", System.Windows.Media.Brushes.Red);
-            }
-            finally
-            {
-                GenerateOcdtButton.IsEnabled = true;
-            }
-        }
-
-        private void AppendOcdtLog(string message, System.Windows.Media.Brush color = null)
-        {
-            var paragraph = new Paragraph(new Run($"[{DateTime.Now:HH:mm:ss}] {message}"));
-            if (color != null)
-            {
-                paragraph.Foreground = color;
-            }
-            paragraph.Margin = new Thickness(0);
-            SuperPackLogRichTextBox.Document.Blocks.Add(paragraph);
-            SuperPackLogRichTextBox.ScrollToEnd();
-        }
-
-        #region OCDT Generator Logic (C# Port)
-        
-        private static readonly byte[] GEYIXUE_KEY = Encoding.ASCII.GetBytes("geyixue");
-
-        private static readonly Dictionary<string, int> PROJECT_ID_MAP = new Dictionary<string, int>
-        {
-            // OnePlus
-            {"LE2100", 20828}, {"LE2110", 19825}, {"PGKM10", 21861}, {"PHP110", 22823},
-            {"PJE110", 23801}, {"PGZ110", 22801},
-            // OPPO
-            {"PDEM10", 19065}, {"PDEM30", 19066}, {"PDHM00", 19161}, {"PDPM00", 19015},
-            {"PDRM00", 20135}, {"PDSM00", 20131}, {"PDYM20", 20001}, {"PECM20", 20041},
-            {"PEDM00", 20061}, {"PEFM00", 20091}, {"PEHM00", 20121}, {"PELM00", 20151},
-            {"PENM00", 20161}, {"PEQM00", 20181}, {"PESM10", 21091}, {"PEYM00", 21061},
-            {"PFCM00", 21081}, {"PFGM00", 21041}, {"PFJM10", 21031}, {"PFTM20", 21102},
-            {"PFVM10", 21037}, {"PGAM10", 21125}, {"PGBM10", 21127}, {"PGCM10", 4256},
-            {"PGFM10", 21135}, {"PGJM10", 21143}, {"PHJ110", 22083}, {"PHM110", 22055},
-            {"PJB110", 22087}, {"PJU110", 23054}, {"PJV110", 23081},
-            // Realme
-            {"RMX2117", 20613}, {"RMX3031", 20615}, {"RMX3370", 21619}, {"RMX3372", 21623},
-            {"RMX3461", 21644}, {"RMX3560", 21641}, {"RMX3610", 22604}, {"RMX3823", 23603}
-        };
-
-        private static readonly Dictionary<string, int> MTK_WITH_OSIG = new Dictionary<string, int>
-        {
-            {"PDYM20", 20001}, {"PECM20", 20041}, {"PDSM00", 20131}, {"PELM00", 20151}, {"RMX2117", 20613}
-        };
-
-        private static readonly Dictionary<string, string> SPECIAL_CONFIG_DB = new Dictionary<string, string>
-        {
-            {"PGZ110", "67c3979696c256762fb2968757567656979687575676569796875756765697968757567656979687575676569796875756765697"},
-            {"RMX3461", "be1397963f125676eed2968757567656979687575676569796875756765697968757567656979687575676569796875756765697"}
-        };
-
-        private byte[] HexStringToByteArray(string hex)
-        {
-            int numberChars = hex.Length;
-            byte[] bytes = new byte[numberChars / 2];
-            for (int i = 0; i < numberChars; i += 2)
-            {
-                bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
-            }
-            return bytes;
-        }
-
-        private byte[] GeyixueEncrypt(byte[] data)
-        {
-            byte[] result = new byte[data.Length];
-            for (int i = 0; i < data.Length; i++)
-            {
-                int xored = data[i] ^ GEYIXUE_KEY[i % GEYIXUE_KEY.Length];
-                result[i] = (byte)(((xored << 4) | (xored >> 4)) & 0xFF);
-            }
-            return result;
-        }
-
-        private byte[] GeyixueDecrypt(byte[] data)
-        {
-            byte[] result = new byte[data.Length];
-            for (int i = 0; i < data.Length; i++)
-            {
-                int rotated = ((data[i] >> 4) | (data[i] << 4)) & 0xFF;
-                result[i] = (byte)(rotated ^ GEYIXUE_KEY[i % GEYIXUE_KEY.Length]);
-            }
-            return result;
-        }
-
-        private async void AnalyzeOcdtButton_Click(object sender, RoutedEventArgs e)
-        {
-            var openFileDialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择OCDT镜像文件",
-                Filter = "OCDT镜像 (*.img)|*.img|所有文件 (*.*)|*.*",
-                FilterIndex = 1,
-                CheckFileExists = true
-            };
-
-            if (openFileDialog.ShowDialog() != true)
-            {
-                return;
-            }
-
-            AnalyzeOcdtButton.IsEnabled = false;
-            var taskStopwatch = Stopwatch.StartNew();
-
-            try
-            {
-                var fileInfo = new FileInfo(openFileDialog.FileName);
-                if (fileInfo.Length < 0x44)
-                {
-                    LogSimpleStatus("[ERROR]OCDT镜像长度不足，无法读取TDCO配置");
-                    return;
-                }
-
-                if (fileInfo.Length > 64L * 1024 * 1024)
-                {
-                    LogSimpleStatus("[ERROR]所选文件超过64MB，不符合OCDT镜像特征");
-                    return;
-                }
-
-                byte[] data = await File.ReadAllBytesAsync(openFileDialog.FileName);
-                LogSimpleStatus($"已选择OCDT镜像 {fileInfo.Name} | {fileInfo.Length / 1024d:F1}KB");
-
-                string magic = Encoding.ASCII.GetString(data, 0, 4);
-                if (!string.Equals(magic, "TDCO", StringComparison.Ordinal))
-                {
-                    LogSimpleStatus("[ERROR]无文件头，项目号为空，无效的OCDT");
-                    return;
-                }
-
-                ushort version = BitConverter.ToUInt16(data, 4);
-                uint dataOffset = BitConverter.ToUInt32(data, 8);
-                uint dataLength = BitConverter.ToUInt32(data, 12);
-                ulong configEnd = (ulong)dataOffset + dataLength;
-                if (dataOffset > (uint)data.Length || configEnd > (ulong)data.Length)
-                {
-                    LogSimpleStatus("[ERROR]TDCO配置偏移或长度超出文件范围");
-                    return;
-                }
-
-                byte[] encryptedConfig = new byte[52];
-                Buffer.BlockCopy(data, 0x10, encryptedConfig, 0, encryptedConfig.Length);
-                byte[] decryptedConfig = GeyixueDecrypt(encryptedConfig);
-
-                int projId1 = decryptedConfig[0] | (decryptedConfig[1] << 8);
-                int projId2 = decryptedConfig[4] | (decryptedConfig[5] << 8);
-                int projId3 = decryptedConfig[8] | (decryptedConfig[9] << 8);
-                bool configAreaBlank = encryptedConfig.All(value => value == 0x00) ||
-                                       encryptedConfig.All(value => value == 0xFF);
-                bool projectIdEmpty = configAreaBlank ||
-                                      (projId1 == 0 && projId2 == 0 && projId3 == 0);
-                bool projectIdsMatch = projId1 == projId2 && projId1 == projId3;
-
-                string variant = "standard";
-                if (decryptedConfig[2] == 0x02)
-                {
-                    variant = "fill02";
-                }
-                else if (decryptedConfig.Skip(22).Any(value => value != 0) &&
-                         decryptedConfig.Skip(22).Take(GEYIXUE_KEY.Length).SequenceEqual(GEYIXUE_KEY))
-                {
-                    variant = "geyixue_fill";
-                }
-                if (!projectIdsMatch)
-                {
-                    variant = "mixed_projid";
-                }
-
-                bool is8Mb = fileInfo.Length > 1024 * 1024;
-                bool hasOsig = data.Length >= 0x1200 &&
-                               Encoding.ASCII.GetString(data, 0x1000, 4) == "OSIG";
-                uint? osigVersion = hasOsig ? BitConverter.ToUInt32(data, 0x1004) : null;
-                string fileType = is8Mb
-                    ? hasOsig ? "8MB MTK + OSIG" : "8MB MTK（无OSIG）"
-                    : "128KB 高通";
-
-                LogSimpleStatus($"TDCO信息 | 版本 {version} | 偏移 0x{dataOffset:X} | 长度 {dataLength}");
-                LogSimpleStatus(configAreaBlank
-                    ? "项目号 | 空"
-                    : $"项目号 | {projId1}, {projId2}, {projId3}");
-                LogSimpleStatus($"项目号一致性 | {(projectIdsMatch ? "一致" : "不一致")}");
-                LogSimpleStatus($"配置变体 | {variant}");
-                LogSimpleStatus($"文件类型 | {fileType}");
-
-                var matchedDevice = PROJECT_ID_MAP.FirstOrDefault(item => item.Value == projId1);
-                if (!string.IsNullOrEmpty(matchedDevice.Key))
-                {
-                    LogSimpleStatus($"匹配设备 | {matchedDevice.Key} | Project ID {matchedDevice.Value}");
-                    if (MTK_WITH_OSIG.ContainsKey(matchedDevice.Key))
-                    {
-                        LogSimpleStatus("警告: 该机型属于旧款MTK设备，需要有效OSIG签名");
-                    }
-                }
-                else
-                {
-                    LogSimpleStatus($"匹配设备 | 未收录 | Project ID {projId1}");
-                }
-
-                if (hasOsig)
-                {
-                    byte[] deviceId = new byte[16];
-                    Buffer.BlockCopy(data, 0x1010, deviceId, 0, deviceId.Length);
-
-                    byte[] md5Bytes = new byte[32];
-                    Buffer.BlockCopy(data, 0x1020, md5Bytes, 0, md5Bytes.Length);
-                    string md5Text = Encoding.ASCII.GetString(md5Bytes).TrimEnd('\0');
-                    bool md5IsText = md5Text.All(character => character >= 32 && character <= 126);
-
-                    byte[] tdcoCopy = new byte[0x44];
-                    Buffer.BlockCopy(data, 0x1040, tdcoCopy, 0, tdcoCopy.Length);
-                    bool hasTdcoCopy = tdcoCopy.Any(value => value != 0);
-
-                    byte[] signature = new byte[0x100];
-                    Buffer.BlockCopy(data, 0x1100, signature, 0, signature.Length);
-                    bool hasRsaSignature = signature.Any(value => value != 0);
-
-                    bool hasBackupOsig = data.Length >= 0x2200 &&
-                                         Encoding.ASCII.GetString(data, 0x2000, 4) == "OSIG";
-
-                    LogSimpleStatus($"OSIG信息 | 版本 {osigVersion} | Device ID {Convert.ToHexString(deviceId).ToLowerInvariant()}");
-                    LogSimpleStatus($"OSIG MD5 | {(md5IsText && !string.IsNullOrWhiteSpace(md5Text) ? md5Text : Convert.ToHexString(md5Bytes).ToLowerInvariant())}");
-                    LogSimpleStatus($"TDCO副本 | {(hasTdcoCopy ? "存在" : "全零")}");
-                    LogSimpleStatus($"RSA签名 | {(hasRsaSignature ? "存在（256字节）" : "不存在")}");
-                    LogSimpleStatus($"备份OSIG | {(hasBackupOsig ? "存在" : "不存在")}");
-                }
-                else
-                {
-                    LogSimpleStatus("OSIG信息 | 不存在");
-                }
-
-                if (projectIdEmpty)
-                {
-                    LogSimpleStatus("[ERROR]检测结果 | 项目号为空，OCDT无效");
-                }
-                else
-                {
-                    LogSimpleStatus("检测结果 | 项目号非空，OCDT有效");
-                }
-
-                taskStopwatch.Stop();
-                LogSimpleStatus($"任务结束，耗时{taskStopwatch.Elapsed.TotalSeconds:F1}秒.");
-            }
-            catch (Exception ex)
-            {
-                LogSimpleStatus($"[ERROR]OCDT分析失败 | {ex.Message}");
-            }
-            finally
-            {
-                AnalyzeOcdtButton.IsEnabled = true;
-            }
-        }
-
-        private byte[] GenerateOcdtConfig(int projIdNum, string strId, string variant = "standard")
-        {
-            if (!string.IsNullOrEmpty(strId) && SPECIAL_CONFIG_DB.ContainsKey(strId))
-            {
-                return HexStringToByteArray(SPECIAL_CONFIG_DB[strId]);
-            }
-
-            if (variant == "mixed_projid")
-            {
-                foreach (var kvp in PROJECT_ID_MAP)
-                {
-                    if (kvp.Value == projIdNum && SPECIAL_CONFIG_DB.ContainsKey(kvp.Key))
-                    {
-                        return HexStringToByteArray(SPECIAL_CONFIG_DB[kvp.Key]);
-                    }
-                }
-            }
-
-            byte[] plain = new byte[52];
-            byte lo = (byte)(projIdNum & 0xFF);
-            byte hi = (byte)((projIdNum >> 8) & 0xFF);
-
-            plain[0] = lo; plain[1] = hi;
-            plain[4] = lo; plain[5] = hi;
-            plain[8] = lo; plain[9] = hi;
-
-            if (variant == "fill02")
-            {
-                plain[2] = 0x02;
-                plain[6] = 0x02;
-                plain[10] = 0x02;
-            }
-            else if (variant == "geyixue_fill")
-            {
-                for (int i = 22; i < 52; i++)
-                {
-                    plain[i] = GEYIXUE_KEY[i % GEYIXUE_KEY.Length];
-                }
-            }
-
-            return GeyixueEncrypt(plain);
-        }
-
-        private string Generate8MbOcdt(int projIdNum, string outputPath, string variant = "standard", byte[] osigBackup = null, string strId = null)
-        {
-            byte[] data = new byte[8 * 1024 * 1024];
-
-            // TDCO Header
-            Buffer.BlockCopy(Encoding.ASCII.GetBytes("TDCO"), 0, data, 0, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)0x0001), 0, data, 4, 2);
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)0x0000), 0, data, 6, 2);
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)0x10), 0, data, 8, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)0x34), 0, data, 12, 4);
-
-            byte[] config = GenerateOcdtConfig(projIdNum, strId, variant);
-            Buffer.BlockCopy(config, 0, data, 0x10, config.Length);
-
-            bool needsOsig = false;
-            if (!string.IsNullOrEmpty(strId) && MTK_WITH_OSIG.ContainsKey(strId))
-            {
-                needsOsig = true;
-            }
-            else if (MTK_WITH_OSIG.ContainsValue(projIdNum))
-            {
-                needsOsig = true;
-            }
-
-            if (needsOsig)
-            {
-                if (osigBackup != null)
-                {
-                    if (osigBackup.Length >= 0x1200)
-                    {
-                        Buffer.BlockCopy(osigBackup, 0x1000, data, 0x1000, 0x200);
-                        Dispatcher.Invoke(() => AppendOcdtLog("  使用备份 OSIG 数据"));
-                    }
-                    else
-                    {
-                        Dispatcher.Invoke(() => AppendOcdtLog("  警告: OSIG 备份数据不足", System.Windows.Media.Brushes.Orange));
-                    }
-                }
-                else
-                {
-                    byte[] osigBlock = new byte[0x200];
-                    Buffer.BlockCopy(Encoding.ASCII.GetBytes("OSIG"), 0, osigBlock, 0, 4);
-                    Buffer.BlockCopy(BitConverter.GetBytes((uint)0), 0, osigBlock, 4, 4);
-                    Buffer.BlockCopy(HexStringToByteArray("30000000000000000000000000000000"), 0, osigBlock, 0x10, 16);
-                    Buffer.BlockCopy(osigBlock, 0, data, 0x1000, osigBlock.Length);
-                    Dispatcher.Invoke(() => {
-                        AppendOcdtLog("  生成空 OSIG (Version=0, 无RSA签名)");
-                        AppendOcdtLog("  注意: 此设备为旧款MTK，无真实签名可能无法使用", System.Windows.Media.Brushes.Orange);
-                    });
-                }
-            }
-
-            File.WriteAllBytes(outputPath, data);
-            return outputPath;
-        }
-
-        private string Generate128KbOcdt(int projIdNum, string outputPath, string variant = "standard", byte[] osigData = null, string strId = null)
-        {
-            byte[] data = new byte[128 * 1024];
-
-            // TDCO Header
-            Buffer.BlockCopy(Encoding.ASCII.GetBytes("TDCO"), 0, data, 0, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)0x0001), 0, data, 4, 2);
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)0x0000), 0, data, 6, 2);
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)0x10), 0, data, 8, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)0x34), 0, data, 12, 4);
-
-            byte[] config = GenerateOcdtConfig(projIdNum, strId, variant);
-            Buffer.BlockCopy(config, 0, data, 0x10, config.Length);
-
-            byte[] osigBlock = new byte[512];
-            if (osigData != null)
-            {
-                int copyLen = Math.Min(osigData.Length, 512);
-                Buffer.BlockCopy(osigData, 0, osigBlock, 0, copyLen);
-            }
-            else
-            {
-                Buffer.BlockCopy(Encoding.ASCII.GetBytes("OSIG"), 0, osigBlock, 0, 4);
-                Buffer.BlockCopy(HexStringToByteArray("30000000000000000000000000000000"), 0, osigBlock, 0x10, 16);
-                Buffer.BlockCopy(Encoding.ASCII.GetBytes("TDCO"), 0, osigBlock, 0x50, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes((uint)0x0001), 0, osigBlock, 0x54, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes((uint)0x10), 0, osigBlock, 0x58, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes((uint)0x34), 0, osigBlock, 0x5C, 4);
-            }
-
-            Buffer.BlockCopy(osigBlock, 0, data, 0x1000, 512);
-            Buffer.BlockCopy(osigBlock, 0, data, 0x2000, 512);
-
-            File.WriteAllBytes(outputPath, data);
-            return outputPath;
-        }
-
-        #endregion
-
         private async void ScreenOffButton_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -7558,8 +4496,8 @@ namespace WpfApp1
                 // 检查工具是否存在
                 if (!File.Exists(adbPath) && !File.Exists(fastbootPath))
                 {
-                    status = "未连接";
-                    connectionType = "--";
+                    status = "缺少ADB/Fastboot";
+                    connectionType = "未找到platform-tools";
                     
                     string windowsVersion = await GetWindowsVersionAsync();
                     if (!IsDeviceDetectionCycleCurrent(detectionVersion)) return;
@@ -7588,12 +4526,14 @@ namespace WpfApp1
                 
                 bool hasAdbDevice = adbDevicesOutput.Contains("\tdevice");
                 bool hasFastbootDevice = fastbootDevicesOutput.Contains("fastboot");
+                bool hasUnauthorizedDevice = adbDevicesOutput.Contains("\tunauthorized");
+                bool hasOfflineDevice = adbDevicesOutput.Contains("\toffline");
                 
                 // 如果两种设备都没有连接
                 if (!hasAdbDevice && !hasFastbootDevice)
                 {
-                    status = "未连接";
-                    connectionType = "等待设备连接...";
+                    status = hasUnauthorizedDevice ? "设备未授权" : (hasOfflineDevice ? "设备离线" : "未连接");
+                    connectionType = hasUnauthorizedDevice ? "请在手机屏幕上允许USB调试" : (hasOfflineDevice ? "请重新插拔USB数据线" : "等待设备连接...");
                     
                     // 清空设备序列号列表
                     Dispatcher.Invoke(() =>
@@ -7705,6 +4645,7 @@ namespace WpfApp1
                     
                     // 并行获取设备信息（使用-s参数指定设备）
                     var deviceModelTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.product.model");
+                    var marketNameTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.product.marketname");
                     var deviceCodeTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.product.device");
                     var androidVersionTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.build.version.release");
                     var unlockStatusTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.boot.unlocked");
@@ -7713,23 +4654,44 @@ namespace WpfApp1
                     var selinuxStatusTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getenforce");
                     var kernelVersionTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell uname -r");
                     var cpuInfoTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell cat /proc/cpuinfo");
+                    var socModelTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.soc.model");
+                    var socManufacturerTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.soc.manufacturer");
+                    var boardPlatformTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.board.platform");
+                    var hardwareTask = GetCommandOutput(adbPath, $"-s {deviceSerial} shell getprop ro.hardware");
                     
                     // 等待所有任务完成
                     var deviceInfoResults = await Task.WhenAll(
-                        deviceModelTask, deviceCodeTask, androidVersionTask, 
-                        unlockStatusTask, slotSuffixTask, selinuxStatusTask, kernelVersionTask, flashLockedTask, cpuInfoTask
+                        deviceModelTask, marketNameTask, deviceCodeTask, androidVersionTask, 
+                        unlockStatusTask, slotSuffixTask, selinuxStatusTask, kernelVersionTask, flashLockedTask, cpuInfoTask,
+                        socModelTask, socManufacturerTask, boardPlatformTask, hardwareTask
                     );
                     if (!IsDeviceDetectionCycleCurrent(detectionVersion)) return;
                     
                     string deviceModel = deviceInfoResults[0];
-                    string deviceCode = deviceInfoResults[1];
-                    string androidVersion = deviceInfoResults[2];
-                    string unlockStatus = deviceInfoResults[3];
-                    string slotSuffix = deviceInfoResults[4];
-                    string selinuxStatus = deviceInfoResults[5];
-                    string kernelVersion = deviceInfoResults[6];
-                    string flashLocked = deviceInfoResults[7];
-                    string cpuInfo = deviceInfoResults[8];
+                    string marketName = deviceInfoResults[1];
+                    string deviceCode = deviceInfoResults[2];
+                    string androidVersion = deviceInfoResults[3];
+                    string unlockStatus = deviceInfoResults[4];
+                    string slotSuffix = deviceInfoResults[5];
+                    string selinuxStatus = deviceInfoResults[6];
+                    string kernelVersion = deviceInfoResults[7];
+                    string flashLocked = deviceInfoResults[8];
+                    string cpuInfo = deviceInfoResults[9];
+                    string socModel = deviceInfoResults[10];
+                    string socManufacturer = deviceInfoResults[11];
+                    string boardPlatform = deviceInfoResults[12];
+                    string hardware = deviceInfoResults[13];
+
+                    string rawMarket = marketName.Trim();
+                    string rawModel = deviceModel.Trim();
+                    if (!string.IsNullOrEmpty(rawMarket))
+                    {
+                        deviceModel = rawMarket;
+                    }
+                    else if (!string.IsNullOrEmpty(rawModel))
+                    {
+                        deviceModel = rawModel;
+                    }
 
                     string procVersion = await GetCommandOutput(adbPath, $"-s {deviceSerial} shell cat /proc/version");
                     if (!IsDeviceDetectionCycleCurrent(detectionVersion)) return;
@@ -7747,35 +4709,66 @@ namespace WpfApp1
                     if (!IsDeviceDetectionCycleCurrent(detectionVersion)) return;
                     UpdateBatteryFromDumpsysOutput(batteryOutput, detectionVersion);
                     
-                    // 解析CPU制造商和代号
+                    // 直接获取CPU硬件代号 (纯粹读取硬件SoC代号属性，绝不直接读取任何CPU营销名称)
                     string cpuManufacturer = "--";
                     string cpuCodeName = "--";
-                    if (!string.IsNullOrEmpty(cpuInfo))
+
+                    string trimmedSoc = socModel.Trim().ToUpperInvariant();
+                    if (!string.IsNullOrEmpty(trimmedSoc) && trimmedSoc != "--")
                     {
-                        if (cpuInfo.Contains("MediaTek"))
+                        cpuCodeName = trimmedSoc;
+                    }
+
+                    if (cpuCodeName == "--" && !string.IsNullOrEmpty(boardPlatform))
+                    {
+                        var match = System.Text.RegularExpressions.Regex.Match(boardPlatform.Trim(), @"(SM\d+|MT\d+|HI\d+|SDM\d+|MSM\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (match.Success)
                         {
-                            cpuManufacturer = "联发科";
+                            cpuCodeName = match.Value.ToUpperInvariant();
                         }
-                        else if (cpuInfo.Contains("Qualcomm"))
-                        {
-                            cpuManufacturer = "高通骁龙";
-                        }
-                        
-                        // 解析CPU代号 - 从Hardware行提取SM或MT开头的代号
+                    }
+
+                    if (cpuCodeName == "--" && !string.IsNullOrEmpty(cpuInfo))
+                    {
                         var cpuInfoLines = cpuInfo.Split('\n');
                         foreach (var cpuLine in cpuInfoLines)
                         {
                             if (cpuLine.StartsWith("Hardware", StringComparison.OrdinalIgnoreCase))
                             {
                                 var hardwareLine = cpuLine.Trim();
-                                // 使用正则表达式匹配SM后跟数字或MT后跟数字的模式
-                                var match = System.Text.RegularExpressions.Regex.Match(hardwareLine, @"(SM\d+|MT\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                var match = System.Text.RegularExpressions.Regex.Match(hardwareLine, @"(SM\d+|MT\d+|HI\d+|SDM\d+|MSM\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                                 if (match.Success)
                                 {
-                                    cpuCodeName = match.Value.ToUpper();
+                                    cpuCodeName = match.Value.ToUpperInvariant();
                                 }
                                 break;
                             }
+                        }
+                    }
+
+                    // 根据CPU硬件代号推断CPU厂商
+                    if (cpuCodeName.StartsWith("SM") || cpuCodeName.StartsWith("SDM") || cpuCodeName.StartsWith("MSM") || cpuCodeName.StartsWith("QCM"))
+                    {
+                        cpuManufacturer = "高通骁龙";
+                    }
+                    else if (cpuCodeName.StartsWith("MT"))
+                    {
+                        cpuManufacturer = "联发科";
+                    }
+                    else if (cpuCodeName.StartsWith("HI") || cpuCodeName.Contains("KIRIN"))
+                    {
+                        cpuManufacturer = "华为海思";
+                    }
+                    else
+                    {
+                        string combinedSocInfo = (socManufacturer + " " + hardware + " " + boardPlatform + " " + cpuInfo).ToUpperInvariant();
+                        if (combinedSocInfo.Contains("QTI") || combinedSocInfo.Contains("QUALCOMM") || combinedSocInfo.Contains("QCOM"))
+                        {
+                            cpuManufacturer = "高通骁龙";
+                        }
+                        else if (combinedSocInfo.Contains("MEDIATEK") || combinedSocInfo.Contains("MTK"))
+                        {
+                            cpuManufacturer = "联发科";
                         }
                     }
                     
@@ -7849,6 +4842,7 @@ namespace WpfApp1
                             );
                         });
                         UpdateLastDeviceInfo(status, connectionType, deviceSerial, trimmedModel, trimmedCode, trimmedAndroidVersion, unlockText, slotText, selinuxText, trimmedKernelVersion, cpuManufacturer, cpuCodeName, windowsVersion);
+                        _ = RefreshStorageMemoryAsync(silent: true);
                     }
                     return;
                 }
@@ -8272,9 +5266,11 @@ namespace WpfApp1
             CancellationToken cancellationToken = default)
         {
             Process? process = null;
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
             try
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                linkedCts.Token.ThrowIfCancellationRequested();
                 process = new Process
                 {
                     StartInfo = new ProcessStartInfo
@@ -8284,13 +5280,15 @@ namespace WpfApp1
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
-                        CreateNoWindow = true
+                        CreateNoWindow = true,
+                        StandardOutputEncoding = System.Text.Encoding.UTF8,
+                        StandardErrorEncoding = System.Text.Encoding.UTF8
                     }
                 };
                 process.Start();
                 Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
                 Task<string> errorTask = process.StandardError.ReadToEndAsync();
-                await process.WaitForExitAsync(cancellationToken);
+                await process.WaitForExitAsync(linkedCts.Token);
                 string output = await outputTask;
                 string error = await errorTask;
 
@@ -8312,7 +5310,8 @@ namespace WpfApp1
                 catch
                 {
                 }
-                throw;
+                if (cancellationToken.IsCancellationRequested) throw;
+                return string.Empty;
             }
             catch
             {
@@ -8326,33 +5325,24 @@ namespace WpfApp1
 
         private string GetToolPath(string toolName)
         {
-            // 可能的路径列表，按优先级排序
-            var possiblePaths = new List<string>
+            var candidates = new List<string>
             {
-                // 1. 应用程序同目录下的platform-tools（最高优先级）
-                Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "", "platform-tools", toolName),
-                
-                // 2. 应用程序目录下的platform-tools
                 Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools", toolName),
-                
-                // 3. 应用程序上级目录的platform-tools
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, toolName),
+                Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "", "platform-tools", toolName),
+                Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "", toolName),
+                Path.Combine(Environment.CurrentDirectory, "platform-tools", toolName),
+                Path.Combine(Environment.CurrentDirectory, toolName),
                 Path.Combine(Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)?.FullName ?? "", "platform-tools", toolName),
-                
-                // 4. 解决方案根目录的platform-tools
                 Path.Combine(Directory.GetParent(Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)?.FullName ?? "")?.FullName ?? "", "platform-tools", toolName),
-                
-                // 5. 系统PATH中的工具
-                toolName,
-                
-                // 6. Android SDK默认路径
+                Path.Combine(Directory.GetParent(Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)?.FullName ?? "")?.FullName ?? "", "VioletToolBox", "platform-tools", toolName),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Android", "Sdk", "platform-tools", toolName),
-                
-                // 7. 用户目录下的Android SDK
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "AppData", "Local", "Android", "Sdk", "platform-tools", toolName)
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "AppData", "Local", "Android", "Sdk", "platform-tools", toolName),
+                @"C:\platform-tools\" + toolName,
+                @"D:\platform-tools\" + toolName
             };
 
-            // 检查每个可能的路径
-            foreach (var path in possiblePaths)
+            foreach (var path in candidates)
             {
                 if (!string.IsNullOrEmpty(path) && File.Exists(path))
                 {
@@ -8360,7 +5350,35 @@ namespace WpfApp1
                 }
             }
 
-            // 如果都找不到，返回工具名（让系统在PATH中查找）
+            try
+            {
+                string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(pathEnv))
+                {
+                    foreach (var rawDir in pathEnv.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string dir = rawDir.Trim().Trim('"');
+                        if (string.IsNullOrEmpty(dir)) continue;
+                        try
+                        {
+                            string full = Path.Combine(dir, toolName);
+                            if (File.Exists(full))
+                            {
+                                return full;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+
+            string defaultAppToolPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools", toolName);
+            if (File.Exists(defaultAppToolPath))
+            {
+                return defaultAppToolPath;
+            }
+
             return toolName;
         }
 
@@ -8398,12 +5416,19 @@ namespace WpfApp1
                         return;
                     }
 
-                    if (BatteryControl != null)
+                    if (BatteryProgressBar != null)
                     {
-                        BatteryControl.Maximum = scale > 0 ? scale : 100;
-                        BatteryControl.Value = Math.Clamp(level, 0, BatteryControl.Maximum);
-                        BatteryControl.IsCharging = isCharging;
-                        BatteryControl.TemperatureText = tempText;
+                        BatteryProgressBar.Maximum = scale > 0 ? scale : 100;
+                        BatteryProgressBar.Value = Math.Clamp(level, 0, BatteryProgressBar.Maximum);
+                    }
+                    if (BatteryValueText != null)
+                    {
+                        BatteryValueText.Text = $"{level}%";
+                    }
+                    if (BatteryDetailText != null)
+                    {
+                        string chargingStr = isCharging ? "充电中" : "未充电";
+                        BatteryDetailText.Text = tempText != "--" ? $"{chargingStr} · {tempText}" : chargingStr;
                     }
                 });
             }
@@ -8428,930 +5453,6 @@ namespace WpfApp1
         {
     }
 
-    private sealed class DriverFileItem
-    {
-        public string Name { get; set; } = string.Empty;
-        public string Url { get; set; } = string.Empty;
-        public string IconSource { get; set; } = "images/exe.svg";
-    }
-
-    private async void DriverTile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingDriverList = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取刷机驱动列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(DriverListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何驱动文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/exe.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个驱动条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取驱动列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingDriverList = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void RootManagerTile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingRootManagerList || _isLoadingDriverList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingRootManagerList = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取ROOT管理器列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(RootManagerListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何ROOT管理器文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/安卓.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个ROOT管理器条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取ROOT管理器列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingRootManagerList = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void Kernel4Tile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingKernel4List || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingKernel4List = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取4系内核AK3列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(Kernel4ListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何4系内核AK3文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个4系内核AK3条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取4系内核AK3列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingKernel4List = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void OnePlusAk3Tile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingOnePlusAk3List || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingOnePlusAk3List = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取一加专用AK3列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(OnePlusAk3ListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何一加专用AK3文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个一加专用AK3条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取一加专用AK3列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingOnePlusAk3List = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void OujiaAk3Tile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingOujiaAk3List || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingOujiaAk3List = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取欧加通用AK3列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(OujiaAk3ListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何欧加通用AK3文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个欧加通用AK3条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取欧加通用AK3列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingOujiaAk3List = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void AndroidAk3Tile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingAndroidAk3List || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingUtilitySoftwareList || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingAndroidAk3List = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取安卓通用AK3列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(AndroidAk3ListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何安卓通用AK3文件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个安卓通用AK3条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取安卓通用AK3列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingAndroidAk3List = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void UtilitySoftwareIcon_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingUtilitySoftwareList || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUserUploadList)
-        {
-            return;
-        }
-
-        _isLoadingUtilitySoftwareList = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取实用软件列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(UtilitySoftwareListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何实用软件条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个实用软件条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取实用软件列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingUtilitySoftwareList = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private async void UserUploadIcon_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        if (_isLoadingUserUploadList || _isLoadingDriverList || _isLoadingRootManagerList || _isLoadingKernel4List || _isLoadingOnePlusAk3List || _isLoadingOujiaAk3List || _isLoadingAndroidAk3List || _isLoadingUtilitySoftwareList)
-        {
-            return;
-        }
-
-        _isLoadingUserUploadList = true;
-        try
-        {
-            AddDownloadLogMessage("信息", "正在获取用户上传列表...");
-
-            DriverTileView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Visible;
-            DriverFileListBox.Visibility = Visibility.Collapsed;
-            DriverLoadingView.Visibility = Visibility.Visible;
-
-            var items = await LoadDriverFileItemsAsync(UserUploadListSourceUrl);
-            if (items.Count == 0)
-            {
-                AddDownloadLogMessage("警告", "未解析到任何用户上传条目");
-                DriverLoadingView.Visibility = Visibility.Collapsed;
-                DriverListView.Visibility = Visibility.Collapsed;
-                DriverTileView.Visibility = Visibility.Visible;
-                return;
-            }
-
-            foreach (var item in items)
-            {
-                item.IconSource = "images/压缩包.svg";
-            }
-
-            DriverFileListBox.ItemsSource = items;
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverFileListBox.Visibility = Visibility.Visible;
-            AddDownloadLogMessage("成功", $"已加载 {items.Count} 个用户上传条目");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"获取用户上传列表失败: {ex.Message}");
-            DriverLoadingView.Visibility = Visibility.Collapsed;
-            DriverListView.Visibility = Visibility.Collapsed;
-            DriverTileView.Visibility = Visibility.Visible;
-        }
-        finally
-        {
-            _isLoadingUserUploadList = false;
-        }
-
-        e.Handled = true;
-    }
-
-    private void NekoDownloaderIcon_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        try
-        {
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var exePath = Path.Combine(baseDir, "exe", "Neko.exe");
-            if (!File.Exists(exePath))
-            {
-                AddDownloadLogMessage("错误", $"未找到 Neko.exe: {exePath}");
-                return;
-            }
-
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = exePath,
-                UseShellExecute = true,
-                WorkingDirectory = Path.GetDirectoryName(exePath)
-            });
-            AddDownloadLogMessage("成功", "已启动 Neko 下载器");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"启动 Neko 下载器失败: {ex.Message}");
-        }
-
-        e.Handled = true;
-    }
-
-    private void NdmDownloaderIcon_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ClickCount != 2)
-        {
-            return;
-        }
-
-        try
-        {
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var candidatePaths = new[]
-            {
-                Path.Combine(baseDir, "NDM.exe"),
-                Path.Combine(baseDir, "exe", "NDM.exe")
-            };
-
-            var exePath = candidatePaths.FirstOrDefault(File.Exists);
-            if (string.IsNullOrEmpty(exePath))
-            {
-                AddDownloadLogMessage("错误", $"未找到 NDM.exe，已尝试路径: {string.Join("; ", candidatePaths)}");
-                return;
-            }
-
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = exePath,
-                UseShellExecute = true,
-                WorkingDirectory = Path.GetDirectoryName(exePath)
-            });
-            AddDownloadLogMessage("成功", "已启动 NDM 下载器");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"启动 NDM 下载器失败: {ex.Message}");
-        }
-
-        e.Handled = true;
-    }
-
-    private void BackToDriverTileButton_Click(object sender, RoutedEventArgs e)
-    {
-        DriverLoadingView.Visibility = Visibility.Collapsed;
-        DriverFileListBox.Visibility = Visibility.Visible;
-        DriverListView.Visibility = Visibility.Collapsed;
-        DriverTileView.Visibility = Visibility.Visible;
-    }
-
-    private static string ToGiteeRawUrl(string url)
-    {
-        if (string.IsNullOrWhiteSpace(url))
-        {
-            return url;
-        }
-
-        if (url.Contains("/raw/", StringComparison.OrdinalIgnoreCase))
-        {
-            return url;
-        }
-
-        var i = url.IndexOf("/blob/", StringComparison.OrdinalIgnoreCase);
-        if (i < 0)
-        {
-            return url;
-        }
-
-        return url.Substring(0, i) + "/raw/" + url.Substring(i + "/blob/".Length);
-    }
-
-    private async Task<List<DriverFileItem>> LoadDriverFileItemsAsync(string sourceUrl)
-    {
-        var candidates = new[]
-        {
-            ToGiteeRawUrl(sourceUrl),
-            sourceUrl
-        }.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-
-        string? lastText = null;
-        foreach (var url in candidates)
-        {
-            try
-            {
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SmartTool");
-                request.Headers.TryAddWithoutValidation("Accept", "application/json,text/plain,*/*");
-
-                using var response = await DriverListHttpClient.SendAsync(request);
-                var text = await response.Content.ReadAsStringAsync();
-                lastText = text;
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    continue;
-                }
-
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                if (text.Contains("<html", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var items = ParseDriverFileItems(text);
-                if (items.Count > 0)
-                {
-                    return items;
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(lastText))
-        {
-            if (lastText.Contains("无法连接", StringComparison.OrdinalIgnoreCase) ||
-                lastText.Contains("人机验证", StringComparison.OrdinalIgnoreCase) ||
-                lastText.Contains("Failed to fetch", StringComparison.OrdinalIgnoreCase))
-            {
-                AddDownloadLogMessage("错误", "列表源返回了人机验证/网络错误提示，暂时无法解析");
-            }
-        }
-
-        return new List<DriverFileItem>();
-    }
-
-    private static List<DriverFileItem> ParseDriverFileItems(string text)
-    {
-        var items = TryParseDriverFileItemsFromJson(text);
-        if (items.Count > 0)
-        {
-            return items;
-        }
-
-        items = TryParseDriverFileItemsFromLooseJson(text);
-        if (items.Count > 0)
-        {
-            return items;
-        }
-
-        return ParseDriverFileItemsFromKeyValueText(text);
-    }
-
-    private static List<DriverFileItem> TryParseDriverFileItemsFromJson(string text)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            var root = doc.RootElement;
-
-            if (root.ValueKind == JsonValueKind.Array)
-            {
-                return ParseDriverFileItemsFromJsonArray(root);
-            }
-
-            if (root.ValueKind == JsonValueKind.Object)
-            {
-                if (TryGetArrayProperty(root, out var files, "files", "items", "drivers", "list", "data"))
-                {
-                    return ParseDriverFileItemsFromJsonArray(files);
-                }
-
-                var single = ParseDriverFileItemFromJsonObject(root);
-                if (single != null)
-                {
-                    return new List<DriverFileItem> { single };
-                }
-            }
-        }
-        catch
-        {
-        }
-
-        return new List<DriverFileItem>();
-    }
-
-    private static List<DriverFileItem> ParseDriverFileItemsFromJsonArray(JsonElement array)
-    {
-        var items = new List<DriverFileItem>();
-        foreach (var el in array.EnumerateArray())
-        {
-            if (el.ValueKind != JsonValueKind.Object)
-            {
-                continue;
-            }
-
-            var item = ParseDriverFileItemFromJsonObject(el);
-            if (item == null)
-            {
-                continue;
-            }
-
-            if (string.IsNullOrWhiteSpace(item.Name) || string.IsNullOrWhiteSpace(item.Url))
-            {
-                continue;
-            }
-
-            items.Add(item);
-        }
-
-        return items;
-    }
-
-    private static DriverFileItem? ParseDriverFileItemFromJsonObject(JsonElement obj)
-    {
-        var name = CleanParsedValue(TryGetStringProperty(obj, "name", "Name", "filename", "fileName", "title"));
-        var url = CleanParsedValue(TryGetStringProperty(obj, "url", "Url", "link", "downloadUrl", "download"));
-
-        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(url))
-        {
-            return null;
-        }
-
-        return new DriverFileItem
-        {
-            Name = name,
-            Url = url
-        };
-    }
-
-    private static string CleanParsedValue(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var v = value.Trim();
-        v = v.Trim('`', '"', '\'');
-        if (v.Contains('`'))
-        {
-            v = v.Replace("`", "").Trim();
-        }
-
-        return v;
-    }
-
-    private static List<DriverFileItem> TryParseDriverFileItemsFromLooseJson(string text)
-    {
-        try
-        {
-            var items = new List<DriverFileItem>();
-            var matches = Regex.Matches(
-                text,
-                "\\{[^\\{\\}]*?\"name\"\\s*:\\s*\"(?<name>[^\"]+)\"[^\\{\\}]*?\"url\"\\s*:\\s*\"(?<url>[^\"]+)\"[^\\{\\}]*?\\}",
-                RegexOptions.IgnoreCase | RegexOptions.Singleline);
-
-            foreach (Match m in matches)
-            {
-                var name = CleanParsedValue(m.Groups["name"].Value);
-                var url = CleanParsedValue(m.Groups["url"].Value);
-                if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(url))
-                {
-                    continue;
-                }
-
-                items.Add(new DriverFileItem { Name = name, Url = url });
-            }
-
-            return items;
-        }
-        catch
-        {
-            return new List<DriverFileItem>();
-        }
-    }
-
-    private static bool TryGetArrayProperty(JsonElement obj, out JsonElement array, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (obj.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Array)
-            {
-                array = prop;
-                return true;
-            }
-        }
-
-        array = default;
-        return false;
-    }
-
-    private static string? TryGetStringProperty(JsonElement obj, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (!obj.TryGetProperty(name, out var prop))
-            {
-                continue;
-            }
-
-            if (prop.ValueKind == JsonValueKind.String)
-            {
-                return prop.GetString();
-            }
-        }
-
-        return null;
-    }
-
-    private static List<DriverFileItem> ParseDriverFileItemsFromKeyValueText(string text)
-    {
-        var items = new List<DriverFileItem>();
-
-        string? currentName = null;
-        string? currentUrl = null;
-
-        foreach (var rawLine in Regex.Split(text, "\r\n|\r|\n"))
-        {
-            var line = rawLine.Trim();
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
-
-            var nameMatch = Regex.Match(line, @"^\s*name\s*[:：]\s*(.+)\s*$", RegexOptions.IgnoreCase);
-            if (nameMatch.Success)
-            {
-                currentName = nameMatch.Groups[1].Value.Trim();
-                currentName = currentName.Trim('`', '"', '\'');
-            }
-
-            var urlMatch = Regex.Match(line, @"^\s*url\s*[:：]\s*(.+)\s*$", RegexOptions.IgnoreCase);
-            if (urlMatch.Success)
-            {
-                currentUrl = urlMatch.Groups[1].Value.Trim();
-                currentUrl = currentUrl.Trim('`', '"', '\'');
-            }
-            else if (line.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-                     line.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            {
-                currentUrl = line.Trim('`', '"', '\'');
-            }
-
-            if (!string.IsNullOrWhiteSpace(currentName) && !string.IsNullOrWhiteSpace(currentUrl))
-            {
-                items.Add(new DriverFileItem
-                {
-                    Name = currentName,
-                    Url = currentUrl
-                });
-                currentName = null;
-                currentUrl = null;
-            }
-        }
-
-        return items;
-    }
-
-    private async Task DownloadAndOpenDriver(string url, string fileName)
-    {
-        try
-        {
-            AddDownloadLogMessage("信息", $"正在下载 {fileName}...");
-            
-            // 创建drivers驱动存放文件夹
-            string driversPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "drivers");
-            if (!Directory.Exists(driversPath))
-            {
-                Directory.CreateDirectory(driversPath);
-            }
-            
-            string filePath = Path.Combine(driversPath, fileName);
-            
-            using (HttpClient client = new HttpClient())
-            {
-                // 设置超时时间10秒
-                client.Timeout = TimeSpan.FromMinutes(10);
-                
-                // 下载文件
-                byte[] fileBytes = await client.GetByteArrayAsync(url);
-                await File.WriteAllBytesAsync(filePath, fileBytes);
-            }
-            
-            AddDownloadLogMessage("成功", $"{fileName} 下载完成，正在打开...");
-            
-            // 自动打开下载的exe文件
-            if (File.Exists(filePath) && Path.GetExtension(filePath).ToLower() == ".exe")
-            {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = filePath,
-                    UseShellExecute = true
-                });
-                AddDownloadLogMessage("成功", $"{fileName} 已启动");
-            }
-            else
-            {
-                AddDownloadLogMessage("警告", $"文件下载完成，但无法自动打开: {filePath}");
-            }
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"下载 {fileName} 失败: {ex.Message}");
-        }
-    }
-
-    private void DriverFileListBox_MouseDoubleClick(object sender, MouseButtonEventArgs e)
-    {
-        if (DriverFileListBox.SelectedItem is not DriverFileItem item)
-        {
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(item.Url))
-        {
-            AddDownloadLogMessage("错误", "下载链接为空");
-            return;
-        }
-
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = item.Url,
-                UseShellExecute = true
-            });
-            AddDownloadLogMessage("信息", $"已打开链接: {item.Url}");
-        }
-        catch (Exception ex)
-        {
-            AddDownloadLogMessage("错误", $"打开链接失败: {ex.Message}");
-        }
-    }
-    
-    // Windows API声明
         private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
         private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
         private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
@@ -10274,7 +6375,7 @@ namespace WpfApp1
                                 bootflash.Value = (int)Math.Round(percentage);
                                 
                                 // 同时更新FlashProgressBar
-                                UpdateProgressBarValue(percentage);
+                                
                             }
                         }
                     }
@@ -10305,9 +6406,9 @@ namespace WpfApp1
                             if (bootflash.Value < 30)
                             {
                                 bootflash.Value = 30;
-                                if (FlashProgressBar != null && FlashProgressBar.Value < 30)
+                                if (bootflash != null && bootflash.Value < 30)
                                 {
-                                    UpdateProgressBarValue(30);
+                                    
                                 }
                             }
                         }
@@ -10317,9 +6418,9 @@ namespace WpfApp1
                             if (bootflash.Value < 70)
                             {
                                 bootflash.Value = 70;
-                                if (FlashProgressBar != null && FlashProgressBar.Value < 70)
+                                if (bootflash != null && bootflash.Value < 70)
                                 {
-                                    UpdateProgressBarValue(70);
+                                    
                                 }
                             }
                         }
@@ -10328,13 +6429,13 @@ namespace WpfApp1
                     {
                         // 操作成功完成
                         bootflash.Value = 90; // 设置为90%，等待最终完成
-                        UpdateProgressBarValue(90);
+                        
                     }
                     else if (output.Contains("Finished") || output.Contains("镜像刷入成功"))
                     {
                         // 刷入完全完成
                         bootflash.Value = 100;
-                        UpdateProgressBarValue(100);
+                        
                         UpdateTransferRateText("完成");
                     }
                 }));
@@ -10759,21 +6860,8 @@ namespace WpfApp1
                         AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] 目标设备: {selectedSerial}\n");
                         AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] 命令: {scrcpyPath} {arguments}\n");
 
-                        startedProcess.OutputDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrWhiteSpace(e.Data))
-                            {
-                                AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] [scrcpy] {e.Data}\n");
-                            }
-                        };
-
-                        startedProcess.ErrorDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrWhiteSpace(e.Data))
-                            {
-                                AppendToLogTextBox($"[{DateTime.Now:HH:mm:ss}] [scrcpy] {e.Data}\n");
-                            }
-                        };
+                        startedProcess.OutputDataReceived += (sender, e) => ProcessScrcpyLogLine(e.Data, false);
+                        startedProcess.ErrorDataReceived += (sender, e) => ProcessScrcpyLogLine(e.Data, true);
 
                         startedProcess.EnableRaisingEvents = true;
                         startedProcess.Exited += (sender, e) =>
@@ -10812,1833 +6900,6 @@ namespace WpfApp1
             }
         }
 
-        private async void ExecuteFastbootCommandButton_Click(object sender, RoutedEventArgs e)
-        {
-            var commandTextBox = this.FindName("FastbootCommandTextBox") as System.Windows.Controls.TextBox;
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            
-            if (commandTextBox != null && logTextBox != null)
-            {
-                string command = commandTextBox.Text.Trim();
-                if (!string.IsNullOrEmpty(command))
-                {
-                    await ExecuteFastbootCommand(command);
-                    string result = "命令已执行";
-                    
-                    if (result.StartsWith("ERROR_DETECTED"))
-                    {
-                        LogToFastboot("命令执行失败：检测到错误信息！", "Red");
-                    }
-                    else
-                    {
-                        LogToFastboot("命令执行完成", "Green");
-                    }
-                }
-                else
-                {
-                    LogToFastboot("请输入fastboot命令", "Yellow");
-                }
-            }
-        }
-
-        private void ClearFastbootLogButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            if (logTextBox != null)
-            {
-                logTextBox.Document.Blocks.Clear();
-                logTextBox.ScrollToHome();
-            }
-        }
-
-        private async void ReadPartitionTableButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox != null && dataGrid != null)
-            {
-                try
-                {
-                    string fastbootPath = GetFastbootPath();
-                    if (string.IsNullOrEmpty(fastbootPath))
-                    {
-                        LogToFastboot("缺少fastboot.exe", "Red");
-                        return;
-                    }
-                    
-                    operationCancellation = BeginFastbootVisualizationOperation();
-                    CancellationToken cancellationToken = operationCancellation.Token;
-                    ReadPartitionTableButton.IsEnabled = false;
-
-                    bool deviceReady;
-                    _fastbootVisualizationWaitingForDevice = true;
-                    try
-                    {
-                        deviceReady = await WaitForFastbootDeviceWithCountdown(
-                            fastbootPath,
-                            60,
-                            cancellationToken);
-                    }
-                    finally
-                    {
-                        _fastbootVisualizationWaitingForDevice = false;
-                    }
-                    if (!deviceReady)
-                    {
-                        LogToFastboot("连接超时...", "Red");
-                        return;
-                    }
-
-                    string result = await ExecuteFastbootCommand(
-                        fastbootPath,
-                        "getvar all",
-                        cancellationToken: cancellationToken);
-                    
-                    if (result.StartsWith("ERROR_DETECTED"))
-                    {
-                        LogToFastboot("命令执行失败", "Red");
-                        return;
-                    }
-                    
-                    var partitions = ParsePartitionInfo(result);
-                    var filteredPartitions = partitions.Where(p => 
-                        !p.PartitionName.ToLower().Contains("slot") &&
-                        !new[] { "sda", "sdb", "sdc", "sdd", "sde", "sdf" }.Contains(p.PartitionName.ToLower())
-                    ).ToList();
-                    
-                    await ShowPartitionTableWithRefreshAsync(dataGrid, filteredPartitions);
-                    ApplyFastbootVisualizationPartitionProtectionState(adbMode: false);
-                    
-                    string deviceSerial = GetSelectedDeviceSerial();
-                    if (string.IsNullOrWhiteSpace(deviceSerial))
-                    {
-                        deviceSerial = ExtractFastbootVar(result, "serialno");
-                        if (IsMissingFastbootValue(deviceSerial))
-                        {
-                            string devicesOutput = await GetCommandOutput(fastbootPath, "devices", cancellationToken);
-                            string firstFastbootLine = devicesOutput
-                                .Split('\n')
-                                .Select(l => l.Trim())
-                                .FirstOrDefault(l => !string.IsNullOrWhiteSpace(l) && l.Contains("fastboot", StringComparison.OrdinalIgnoreCase)) ?? "";
-
-                            if (!string.IsNullOrWhiteSpace(firstFastbootLine))
-                            {
-                                deviceSerial = firstFastbootLine
-                                    .Split(new[] { '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries)
-                                    .FirstOrDefault() ?? "";
-                            }
-                        }
-                    }
-                    if (IsMissingFastbootValue(deviceSerial)) deviceSerial = "--";
-
-                    LogToFastbootStyled(
-                        ("等待设备...", "Black", false),
-                        ($"[{deviceSerial}]", "Purple", true));
-                    LogToFastbootStyled(
-                        ("读取分区表成功,共", "Black", false),
-                        ($"{partitions.Count}", "Purple", true),
-                        ("个分区.", "Black", false));
-
-                    // getvar all 已包含绝大多数设备信息。优先复用本次结果，
-                    // 仅对缺失字段启动补充命令，避免重复创建五个 fastboot 进程。
-                    string productName = ExtractFastbootVar(result, "product");
-                    string unlockStatus = ExtractFastbootVar(result, "unlocked");
-                    string deviceInfo = result;
-                    string currentSlot = ExtractFastbootVar(result, "current-slot");
-                    string isUserspace = ExtractFastbootVar(result, "is-userspace");
-                    string serialArgPrefix = deviceSerial == "--" ? "" : $"-s {deviceSerial} ";
-                    Task<string>? productFallbackTask = IsMissingFastbootValue(productName)
-                        ? GetCommandOutput(fastbootPath, $"{serialArgPrefix}getvar product", cancellationToken)
-                        : null;
-                    bool hasUnlockFlag = result.Contains("Device unlocked: true", StringComparison.OrdinalIgnoreCase) ||
-                                         result.Contains("Device unlocked: false", StringComparison.OrdinalIgnoreCase);
-                    Task<string>? unlockFallbackTask = IsMissingFastbootValue(unlockStatus) && !hasUnlockFlag
-                        ? GetCommandOutput(fastbootPath, $"{serialArgPrefix}getvar unlocked", cancellationToken)
-                        : null;
-                    Task<string>? deviceInfoFallbackTask = IsMissingFastbootValue(unlockStatus) && !hasUnlockFlag
-                        ? GetCommandOutput(fastbootPath, $"{serialArgPrefix}oem device-info", cancellationToken)
-                        : null;
-                    Task<string>? slotFallbackTask = IsMissingFastbootValue(currentSlot)
-                        ? GetCommandOutput(fastbootPath, $"{serialArgPrefix}getvar current-slot", cancellationToken)
-                        : null;
-                    Task<string>? userspaceFallbackTask = IsMissingFastbootValue(isUserspace)
-                        ? GetCommandOutput(fastbootPath, $"{serialArgPrefix}getvar is-userspace", cancellationToken)
-                        : null;
-
-                    var fallbackTasks = new[]
-                    {
-                        productFallbackTask,
-                        unlockFallbackTask,
-                        deviceInfoFallbackTask,
-                        slotFallbackTask,
-                        userspaceFallbackTask
-                    }.Where(task => task != null).Cast<Task<string>>().ToArray();
-                    if (fallbackTasks.Length > 0)
-                    {
-                        await Task.WhenAll(fallbackTasks);
-                    }
-
-                    if (productFallbackTask != null)
-                        productName = ExtractFastbootVar(await productFallbackTask, "product");
-                    if (unlockFallbackTask != null)
-                        unlockStatus = ExtractFastbootVar(await unlockFallbackTask, "unlocked");
-                    if (deviceInfoFallbackTask != null)
-                        deviceInfo = await deviceInfoFallbackTask;
-                    if (slotFallbackTask != null)
-                        currentSlot = ExtractFastbootVar(await slotFallbackTask, "current-slot");
-                    if (userspaceFallbackTask != null)
-                        isUserspace = ExtractFastbootVar(await userspaceFallbackTask, "is-userspace");
-
-                    string unlockText = "--";
-                    if (!string.IsNullOrWhiteSpace(deviceInfo) && deviceInfo.Contains("Device unlocked: true", StringComparison.OrdinalIgnoreCase))
-                    {
-                        unlockText = "已解锁";
-                    }
-                    else if (!string.IsNullOrWhiteSpace(deviceInfo) && deviceInfo.Contains("Device unlocked: false", StringComparison.OrdinalIgnoreCase))
-                    {
-                        unlockText = "未解锁";
-                    }
-                    else if (unlockStatus.Equals("yes", StringComparison.OrdinalIgnoreCase))
-                    {
-                        unlockText = "已解锁";
-                    }
-                    else if (unlockStatus.Equals("no", StringComparison.OrdinalIgnoreCase))
-                    {
-                        unlockText = "未解锁";
-                    }
-
-                    string slotText = currentSlot.Equals("a", StringComparison.OrdinalIgnoreCase) ? "A槽" :
-                                      currentSlot.Equals("b", StringComparison.OrdinalIgnoreCase) ? "B槽" : "--";
-
-                    bool inFastbootD = isUserspace.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
-                                       isUserspace.Equals("true", StringComparison.OrdinalIgnoreCase);
-
-                    LogFastbootDeviceInfo(
-                        string.IsNullOrWhiteSpace(productName) ? "--" : productName,
-                        unlockText,
-                        slotText,
-                        inFastbootD ? "FastbootD" : "Fastboot");
-                    
-                    // 更新Userdata分区大小显示
-                }
-                catch (OperationCanceledException)
-                {
-                    LogFastbootVisualizationOperationStopped("读取Fastboot分区表");
-                }
-                catch (Exception ex)
-                {
-                    LogToFastboot($"读取超时:...{ex.Message}", "Red");
-                }
-                finally
-                {
-                    EndFastbootVisualizationOperation(operationCancellation);
-                    ReadPartitionTableButton.IsEnabled = true;
-                }
-            }
-        }
-        
-        private async void AdbReadPartitionTableButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox != null && dataGrid != null)
-            {
-                try
-                {
-                    string adbPath = GetAdbPath();
-                    if (string.IsNullOrEmpty(adbPath))
-                    {
-                        LogToFastboot("缺少adb.exe", "Red");
-                        return;
-                    }
-
-                    operationCancellation = BeginFastbootVisualizationOperation();
-                    CancellationToken cancellationToken = operationCancellation.Token;
-                    AdbReadPartitionTableButton.IsEnabled = false;
-
-                    string devicesOutput = await GetCommandOutput(adbPath, "devices", cancellationToken);
-                    var adbDevices = devicesOutput
-                        .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                        .Select(line => Regex.Match(line.Trim(), @"^(\S+)\s+(device|unauthorized|offline|no permissions)$", RegexOptions.IgnoreCase))
-                        .Where(match => match.Success)
-                        .Select(match => new
-                        {
-                            Serial = match.Groups[1].Value,
-                            State = match.Groups[2].Value.ToLowerInvariant()
-                        })
-                        .ToList();
-
-                    string selectedSerial = GetSelectedDeviceSerial();
-                    var targetDevice = !string.IsNullOrWhiteSpace(selectedSerial)
-                        ? adbDevices.FirstOrDefault(device => device.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase))
-                        : adbDevices.Count == 1 ? adbDevices[0] : null;
-
-                    if (adbDevices.Count == 0 || (!string.IsNullOrWhiteSpace(selectedSerial) && targetDevice == null))
-                    {
-                        LogToFastbootStyled(
-                            ("连接设备...", "Black", false),
-                            ("未检测到设备", "Red", true));
-                        return;
-                    }
-
-                    if (string.IsNullOrWhiteSpace(selectedSerial) && adbDevices.Count > 1)
-                    {
-                        LogToFastboot("检测到多个ADB设备，请先在设备列表中选择目标设备", "Yellow");
-                        return;
-                    }
-
-                    if (targetDevice?.State == "unauthorized")
-                    {
-                        LogToFastboot("ADB设备未授权，请在手机上允许USB调试授权", "Red");
-                        return;
-                    }
-
-                    if (targetDevice?.State == "offline")
-                    {
-                        LogToFastboot("ADB设备处于离线状态，请重新连接USB后重试", "Red");
-                        return;
-                    }
-
-                    if (targetDevice?.State == "no permissions")
-                    {
-                        LogToFastboot("ADB设备无访问权限，请检查ADB驱动和USB权限", "Red");
-                        return;
-                    }
-
-                    if (targetDevice?.State != "device")
-                    {
-                        LogToFastboot("ADB设备当前不可用，请检查设备连接状态", "Red");
-                        return;
-                    }
-
-                    LogToFastbootStyled(
-                        ("连接设备...", "Black", false),
-                        ($"[{targetDevice.Serial}]", "Purple", true));
-
-                    string adbSerialPrefix = string.IsNullOrWhiteSpace(targetDevice.Serial)
-                        ? string.Empty
-                        : $"-s {targetDevice.Serial} ";
-                    string rootCheckResult = await GetCommandOutput(
-                        adbPath,
-                        $"{adbSerialPrefix}shell \"su -c 'id'\"",
-                        cancellationToken);
-                    if (!Regex.IsMatch(rootCheckResult ?? string.Empty, @"\buid=0\b", RegexOptions.IgnoreCase))
-                    {
-                        LogToFastbootStyled(
-                            ("未授予", "Black", false),
-                            ("Shell ROOT", "Red", true),
-                            ("权限", "Black", false));
-                        return;
-                    }
-
-                    LogToFastbootStyled(
-                        ("已授予 ", "Black", false),
-                        ("Shell ROOT", "Blue", true),
-                        (" 权限", "Black", false));
-
-                    (string partitionRoot, List<PartitionInfo> partitions) =
-                        await ReadAdbPartitionsFromAvailableRootAsync(
-                            adbPath,
-                            targetDevice.Serial,
-                            cancellationToken);
-                    if (partitions.Count == 0)
-                    {
-                        LogToFastboot(
-                            "未找到可读取的 by-name 分区目录，请确认ROOT授权及设备分区路径",
-                            "Red");
-                        return;
-                    }
-                    
-                    var filteredPartitions = partitions.Where(p => 
-                        !p.PartitionName.ToLower().Contains("slot") &&
-                        !new[] { "sda", "sdb", "sdc", "sdd", "sde", "sdf" }.Contains(p.PartitionName.ToLower())
-                    ).ToList();
-                    
-                    await ShowPartitionTableWithRefreshAsync(dataGrid, filteredPartitions, cancellationToken);
-                    ApplyFastbootVisualizationPartitionProtectionState(adbMode: true);
-                    
-                    LogToFastbootStyled(
-                        ("分区表读取完成", "Green", true),
-                        ("，共", "Black", false),
-                        ($"{filteredPartitions.Count}", "Purple", true),
-                        ("个分区", "Black", false));
-                    
-                    // 更新Userdata分区大小显示
-                }
-                catch (OperationCanceledException)
-                {
-                    LogFastbootVisualizationOperationStopped("读取ADB分区表");
-                }
-                catch (Exception ex)
-                {
-                    LogToFastboot($"ADB读取分区表失败: {ex.Message}", "Red");
-                }
-                finally
-                {
-                    EndFastbootVisualizationOperation(operationCancellation);
-                    AdbReadPartitionTableButton.IsEnabled = true;
-                }
-            }
-        }
-
-        private async Task<(string Root, List<PartitionInfo> Partitions)>
-            ReadAdbPartitionsFromAvailableRootAsync(
-                string adbPath,
-                string deviceSerial,
-                CancellationToken cancellationToken = default)
-        {
-            string serialPrefix = string.IsNullOrWhiteSpace(deviceSerial)
-                ? string.Empty
-                : $"-s {deviceSerial} ";
-            var candidateRoots = new List<string>
-            {
-                "/dev/block/by-name",
-                "/dev/block/bootdevice/by-name"
-            };
-
-            async Task<List<PartitionInfo>> TryReadRootAsync(string root)
-            {
-                string listingOutput = await GetCommandOutput(
-                    adbPath,
-                    $"{serialPrefix}shell \"su -c 'ls -l {root}'\"",
-                    cancellationToken);
-                return ParseAdbPartitionInfo(listingOutput);
-            }
-
-            // 优先尝试最常见的两个路径，正常设备只需一次 ls 和一次 /proc/partitions。
-            foreach (string root in candidateRoots)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                List<PartitionInfo> partitions = await TryReadRootAsync(root);
-                if (partitions.Count > 0)
-                {
-                    return (root, partitions);
-                }
-            }
-
-            // 仅在常见路径均失败时才执行 find，避免每次读取都扫描 platform 目录。
-            string discoveredRootsOutput = await GetCommandOutput(
-                adbPath,
-                $"{serialPrefix}shell \"su -c 'find /dev/block/platform -name by-name 2>/dev/null'\"",
-                cancellationToken);
-            IEnumerable<string> discoveredRoots = Regex.Matches(
-                    discoveredRootsOutput ?? string.Empty,
-                    @"(?m)^(/dev/block/platform/[^\r\n]*/by-name)\s*$",
-                    RegexOptions.IgnoreCase)
-                .Cast<Match>()
-                .Select(match => match.Groups[1].Value.Trim())
-                .Distinct(StringComparer.OrdinalIgnoreCase);
-            foreach (string root in discoveredRoots)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                List<PartitionInfo> partitions = await TryReadRootAsync(root);
-                if (partitions.Count > 0)
-                {
-                    return (root, partitions);
-                }
-            }
-
-            return (string.Empty, new List<PartitionInfo>());
-        }
-
-        private async Task ShowPartitionTableWithRefreshAsync(
-            DataGrid dataGrid,
-            IList<PartitionInfo> partitions,
-            CancellationToken cancellationToken = default)
-        {
-            if (dataGrid == null)
-            {
-                return;
-            }
-
-            bool hadItems = false;
-            Dispatcher.Invoke(() =>
-            {
-                if (dataGrid.ItemsSource != allPartitions)
-                {
-                    dataGrid.ItemsSource = allPartitions;
-                }
-
-                hadItems = allPartitions != null && allPartitions.Count > 0;
-                if (hadItems)
-                {
-                    allPartitions.Clear();
-                    dataGrid.Items.Refresh();
-                }
-            });
-
-            if (hadItems)
-            {
-                await Task.Delay(120, cancellationToken);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            Dispatcher.Invoke(() =>
-            {
-                allPartitions.Clear();
-                if (partitions != null)
-                {
-                    foreach (var p in partitions)
-                    {
-                        allPartitions.Add(p);
-                    }
-                }
-                dataGrid.Items.Refresh();
-                DeactivateXiaomiScriptMode();
-            });
-        }
-        
-        private async void ErasePartitionButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox != null && dataGrid != null)
-            {
-                // 获取选中的分区
-                var selectedPartitions = new List<string>();
-                if (dataGrid.ItemsSource is ObservableCollection<PartitionInfo> partitions)
-                {
-                    foreach (var partition in partitions)
-                    {
-                        if (partition.IsSelected)
-                        {
-                            selectedPartitions.Add(partition.PartitionName);
-                        }
-                    }
-                }
-                
-                if (selectedPartitions.Count == 0)
-                {
-                    LogToFastboot("请先选择要擦除的分区", "Red");
-                    return;
-                }
-                
-                if (!ShowErasePartitionConfirmationDialog(selectedPartitions))
-                {
-                    LogToFastboot("用户取消了擦除操作", "Yellow");
-                    return;
-                }
-                
-                try
-                {
-                    operationCancellation = BeginFastbootVisualizationOperation(
-                        stopAtCommandBoundary: true);
-                    CancellationToken cancellationToken = operationCancellation.Token;
-
-                    // 检查设备连接状态
-                    string connectionType = BottomConnectionTypeText?.Text ?? "";
-                    if (connectionType == "系统")
-                    {
-                        await ErasePartitionsUsingAdb(selectedPartitions, logTextBox, cancellationToken);
-                    }
-                    else if (connectionType == "Fastboot")
-                    {
-                        await ErasePartitionsUsingFastboot(selectedPartitions, logTextBox, cancellationToken);
-                    }
-                    else
-                    {
-                        LogToFastboot("设备未连接或连接状态未知，请检查设备连接", "Red");
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    LogFastbootVisualizationOperationStopped("擦除分区");
-                }
-                catch (Exception ex)
-                {
-                    LogToFastboot($"擦除分区失败：{ex.Message}", "Red");
-                }
-                finally
-                {
-                    EndFastbootVisualizationOperation(operationCancellation);
-                }
-            }
-        }
-
-        private string SelectSaveDirectory(string title)
-        {
-            using (var dialog = new FolderBrowserDialog())
-            {
-                dialog.Description = title ?? "请选择保存目录";
-                dialog.UseDescriptionForTitle = true;
-                dialog.ShowNewFolderButton = true;
-
-                var result = dialog.ShowDialog();
-                if (result == System.Windows.Forms.DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.SelectedPath))
-                {
-                    return dialog.SelectedPath;
-                }
-            }
-            return "";
-        }
-
-        private async void ReadPartitionButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            var partitionInfos = dataGrid?.ItemsSource as ObservableCollection<PartitionInfo>;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox != null && dataGrid != null)
-            {
-                // 获取选中的分区
-                var selectedPartitions = new List<string>();
-                if (partitionInfos != null)
-                {
-                    foreach (var partition in partitionInfos)
-                    {
-                        if (partition.IsSelected)
-                        {
-                            selectedPartitions.Add(partition.PartitionName);
-                        }
-                    }
-                }
-                
-                if (selectedPartitions.Count == 0)
-                {
-                    LogToFastboot("请先选择要回读的分区", "Red");
-                    return;
-                }
-
-                string? outputExtension = ShowPartitionBackupFormatDialog("回读分区");
-                if (string.IsNullOrWhiteSpace(outputExtension))
-                {
-                    LogToFastboot("用户取消了回读分区", "Yellow");
-                    return;
-                }
-                
-                try
-                {
-                    string adbPath = GetToolPath("adb.exe");
-                    if (string.IsNullOrEmpty(adbPath))
-                    {
-                        LogToFastboot("未找到adb工具", "Red");
-                        return;
-                    }
-                    
-                    LogToFastboot($"准备回读 {selectedPartitions.Count} 个分区", "Black");
-
-                    string saveDirectory = SelectSaveDirectory("请选择保存回读分区镜像的目录");
-                    if (string.IsNullOrWhiteSpace(saveDirectory))
-                    {
-                        LogToFastboot("用户取消了选择保存目录", "Yellow");
-                        return;
-                    }
-
-                    LogToFastbootStyled(
-                        ("保存路径：", "Black", false),
-                        (saveDirectory, "Blue", false));
-
-                    operationCancellation = BeginFastbootVisualizationOperation();
-                    CancellationToken cancellationToken = operationCancellation.Token;
-                    
-                    // 创建手机端保存目录
-                    await ExecuteAdbCommandWithOutput(
-                        "shell mkdir -p /sdcard/Download",
-                        cancellationToken);
-                    Directory.CreateDirectory(saveDirectory);
-
-                    ResetOperationTransferDisplay();
-                    var successfullyReadImages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    
-                    // 逐个回读选中的分区
-                    foreach (var partitionName in selectedPartitions)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        LogFastbootReadBegin(partitionName);
-                        string remoteFilePath = $"/sdcard/Download/{partitionName}.img";
-                        try
-                        {
-                            // 使用dd命令读取分区到手机存储
-                            string ddCommand = $"shell \"su -c 'dd if=/dev/block/by-name/{partitionName} of={remoteFilePath}'\"";
-                            string result_read = await ExecuteAdbCommandWithOutput(ddCommand, cancellationToken);
-                            
-                            if (result_read.Contains("Permission denied") || result_read.Contains("failed") || result_read.Contains("error"))
-                            {
-                                LogFastbootReadEndFail(partitionName);
-                                if (!string.IsNullOrWhiteSpace(result_read))
-                                {
-                                    LogToFastboot(result_read.Trim(), "Red");
-                                }
-                            }
-                            else
-                            {
-                                // 从手机拉取分区镜像到电脑
-                                string outputFile = Path.Combine(saveDirectory, $"{partitionName}{outputExtension}");
-                                long currentPartitionBytes = await ResolvePartitionTransferSizeAsync(
-                                    remoteFilePath,
-                                    partitionInfos?.FirstOrDefault(p => p.PartitionName == partitionName)?.PartitionSize);
-                                _transferStartTime = DateTime.Now;
-                                ResetOperationTransferDisplay();
-                                Stopwatch transferStopwatch = Stopwatch.StartNew();
-                                double? lastSmoothedSpeed = null;
-                                string result_pull;
-
-                                try
-                                {
-                                    await ExecuteAdbSyncPullAsync(
-                                        remoteFilePath,
-                                        outputFile,
-                                        (receivedBytes, currentFileTotalBytes) =>
-                                        {
-                                            long safeCurrentFileTotalBytes = currentFileTotalBytes > 0 ? currentFileTotalBytes : currentPartitionBytes;
-                                            long transferredBytes = Math.Min(safeCurrentFileTotalBytes, receivedBytes);
-                                            SetOperationTransferProgress(CalculateTransferPercent(transferredBytes, safeCurrentFileTotalBytes));
-                                            SetOperationTransferSpeed(CalculateTransferSpeed(transferStopwatch, receivedBytes, ref lastSmoothedSpeed));
-                                            UpdateOperationTransferElapsed();
-                                        },
-                                        currentPartitionBytes,
-                                        cancellationToken);
-
-                                    SetOperationTransferProgress(100);
-                                    UpdateOperationTransferElapsed();
-                                    result_pull = "success";
-                                }
-                                catch (OperationCanceledException)
-                                {
-                                    throw;
-                                }
-                                catch (Exception ex)
-                                {
-                                    result_pull = $"failed: {ex.Message}";
-                                }
-                                
-                                if (result_pull.Contains("error") || result_pull.Contains("failed"))
-                                {
-                                    LogFastbootReadEndFail(partitionName);
-                                    if (!string.IsNullOrWhiteSpace(result_pull))
-                                    {
-                                        LogToFastboot(result_pull.Trim(), "Red");
-                                    }
-                                }
-                                else
-                                {
-                                    LogFastbootReadEndOk(partitionName);
-                                    successfullyReadImages[partitionName] = outputFile;
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            await CleanupAdbTemporaryFileAsync(remoteFilePath);
-                        }
-                    }
-
-                    try
-                    {
-                        if (selectedPartitions.Count > 0)
-                        {
-                            CompleteOperationTransferDisplay();
-                        }
-
-                        await TryGenerateRawProgramXmlAsync(
-                            adbPath,
-                            saveDirectory,
-                            successfullyReadImages,
-                            cancellationToken);
-
-                        if (Directory.Exists(saveDirectory))
-                        {
-                            Process.Start(new ProcessStartInfo
-                            {
-                                FileName = "explorer.exe",
-                                Arguments = $"\"{saveDirectory}\"",
-                                UseShellExecute = true
-                            });
-                        }
-                        LogToFastboot("回读完成，已打开保存目录", "Green");
-                    }
-                    catch
-                    {
-                        LogToFastboot("回读完成，但打开保存目录失败", "Yellow");
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    LogFastbootVisualizationOperationStopped("回读分区");
-                }
-                catch (Exception ex)
-                {
-                    LogToFastboot($"回读分区失败: {ex.Message}", "Red");
-                }
-                finally
-                {
-                    EndFastbootVisualizationOperation(operationCancellation);
-                }
-            }
-        }
-
-        private void SelectFileButton_Click(object sender, RoutedEventArgs e)
-        {
-            var button = sender as System.Windows.Controls.Button;
-            if (button?.DataContext is PartitionInfo partition)
-            {
-                var openFileDialog = new Microsoft.Win32.OpenFileDialog
-                {
-                    Filter = "Image Files (*.img)|*.img|All files (*.*)|*.*"
-                };
-
-                if (openFileDialog.ShowDialog() == true)
-                {
-                    partition.FilePath = openFileDialog.FileName;
-                }
-            }
-        }
-
-        private void PartitionTableDataGrid_MouseDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
-        {
-            var dataGrid = sender as DataGrid;
-            if (dataGrid?.SelectedItem is PartitionInfo partition)
-            {
-                if (IsFastbootVisualizationPartitionProtected(
-                    partition.PartitionName,
-                    IsFastbootVisualizationAdbMode()))
-                {
-                    partition.IsSelected = false;
-                    e.Handled = true;
-                    return;
-                }
-
-                var openFileDialog = new Microsoft.Win32.OpenFileDialog
-                {
-                    Filter = "Image Files (*.img)|*.img|All files (*.*)|*.*"
-                };
-
-                if (openFileDialog.ShowDialog() == true)
-                {
-                    partition.FilePath = openFileDialog.FileName;
-                    // 自动勾选此行的复选框
-                    partition.IsSelected = true;
-                }
-            }
-        }
-
-        private async void WritePartitionButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox != null && dataGrid != null)
-            {
-                // 获取选中的分区
-                var selectedPartitions = new List<PartitionInfo>();
-                if (dataGrid.ItemsSource is ObservableCollection<PartitionInfo> partitions)
-                {
-                    foreach (var partition in partitions)
-                    {
-                        if (partition.IsSelected)
-                        {
-                            selectedPartitions.Add(partition);
-                        }
-                    }
-                }
-
-                bool adbProtectionMode = IsFastbootVisualizationAdbMode();
-                List<PartitionInfo> protectedSelections = selectedPartitions
-                    .Where(partition => IsFastbootVisualizationPartitionProtected(
-                        partition.PartitionName,
-                        adbProtectionMode))
-                    .ToList();
-                if (protectedSelections.Count > 0)
-                {
-                    foreach (PartitionInfo protectedPartition in protectedSelections)
-                    {
-                        protectedPartition.IsSelected = false;
-                    }
-                    selectedPartitions.RemoveAll(partition => protectedSelections.Contains(partition));
-                    LogToFastbootStyled(
-                        ("保护分区已启用，已跳过：", "Black", false),
-                        (string.Join("、", protectedSelections.Select(partition => partition.PartitionName)), "Orange", true));
-                }
-                
-                if (selectedPartitions.Count == 0)
-                {
-                    LogToFastboot(
-                        protectedSelections.Count > 0
-                            ? "所选分区均受保护，本次未执行写入"
-                            : "请先选择要写入的分区",
-                        protectedSelections.Count > 0 ? "Yellow" : "Red");
-                    return;
-                }
-                
-                // 检查是否所有选中的分区都有文件路径
-                var partitionsWithoutFile = selectedPartitions.Where(p => string.IsNullOrEmpty(p.FilePath) || !System.IO.File.Exists(p.FilePath)).ToList();
-                if (partitionsWithoutFile.Any())
-                {
-                    LogToFastboot($"以下分区未选择文件或文件不存在: {string.Join(", ", partitionsWithoutFile.Select(p => p.PartitionName))}", "Yellow");
-                    return;
-                }
-                
-                bool shouldResumeDeviceDetection = false;
-                try
-                {
-                    operationCancellation = BeginFastbootVisualizationOperation(
-                        stopAtCommandBoundary: true);
-                    CancellationToken cancellationToken = operationCancellation.Token;
-                    // 重置进度条
-                    ResetOperationProgressBar();
-                    
-                    // 计算总文件大小并初始化传输状态
-                    _totalBytesToTransfer = 0;
-                    foreach (var partition in selectedPartitions)
-                    {
-                        if (File.Exists(partition.FilePath))
-                        {
-                            FileInfo fileInfo = new FileInfo(partition.FilePath);
-                            _totalBytesToTransfer += fileInfo.Length;
-                        }
-                    }
-                    
-                    // 初始化传输状态
-                    _currentBytesTransferred = 0;
-                    _currentTransferRate = 0;
-                    _transferStartTime = DateTime.Now;
-                    
-                    // 更新UI显示初始状态
-                     Dispatcher.Invoke(() =>
-                     {
-                         SetOperationProgressTag("0MB/s");
-                     });
-                    
-                    // 当前页面选择的是具体的 bat 文件，不能读取“基本刷入”页面的目录输入框。
-                    string selectedFlashScript = FlashBatTextBox?.Text?.Trim() ?? "";
-                    bool hasXiaomiScript = HasActiveParsedXiaomiScript();
-                    
-                    // 检查设备连接状态
-                    string currentConnectionType = "未知";
-                    if (BottomConnectionTypeText != null)
-                    {
-                        currentConnectionType = GetRawLocalizedText(BottomConnectionTypeText);
-                    }
-
-                    // 主页状态存在刷新延迟。除明确的系统模式外，直接通过 fastboot devices
-                    // 确认目标设备，避免设备已经连接却仍被“未知”状态拦截。
-                    if (currentConnectionType != "系统")
-                    {
-                        string fastbootSerial = await ResolveConnectedFastbootSerialAsync(cancellationToken);
-                        if (string.IsNullOrWhiteSpace(fastbootSerial))
-                        {
-                            LogToFastbootStyled(
-                                ("连接Fastboot设备...", "Black", false),
-                                ("Error", "Red", true));
-                            return;
-                        }
-
-                        currentConnectionType = "Fastboot";
-                        LogToFastbootStyled(
-                            ("连接Fastboot设备...", "Black", false),
-                            ($"[{fastbootSerial}]", "Purple", true));
-                    }
-                    
-                    // 如果检测到设备处于Fastboot状态，先停止设备检测
-                    if (currentConnectionType == "Fastboot")
-                    {
-                        var simulatedStopButton = new System.Windows.Controls.Button
-                        {
-                            Content = "停止检测设备"
-                        };
-                        Button_Click_1(simulatedStopButton, new RoutedEventArgs());
-                        shouldResumeDeviceDetection = true;
-                        LogToFastboot("委托主页停止异步设备检测...Done", "Green");
-                    }
-                    
-                    // 根据是否有小米线刷脚本和设备连接状态选择写入方式
-                    if (hasXiaomiScript && currentConnectionType == "Fastboot")
-                    {
-                        (bool slotAModeAvailable, string slotAModeReason) =
-                            await CheckSlotAModeAvailabilityAsync(
-                                _parsedXiaomiFlashScriptLines!,
-                                cancellationToken);
-                        XiaomiFlashMode? selectedMode = ShowXiaomiFlashModeDialog(
-                            slotAModeAvailable,
-                            slotAModeReason);
-                        if (!selectedMode.HasValue)
-                        {
-                            LogToFastboot("已取消小米线刷", "Black");
-                            return;
-                        }
-
-                        LogToFastboot(
-                            selectedMode == XiaomiFlashMode.SlotA
-                                ? "小米线刷模式：Slot_A 精简模式"
-                                : "小米线刷模式：传统模式",
-                            "Blue");
-
-                        // 使用小米线刷脚本执行刷写
-                        bool scriptSucceeded = await ExecuteXiaomiFlashScript(
-                            selectedFlashScript,
-                            logTextBox,
-                            allPartitions.ToList(),
-                            selectedMode.Value,
-                            cancellationToken);
-                        if (!scriptSucceeded)
-                        {
-                            LogToFastboot("脚本未完全成功，请检查日志；存在分区失败时锁BL会被跳过", "Yellow");
-                        }
-                    }
-                    else if (currentConnectionType == "系统")
-                    {
-                        // 使用 ADB 命令写入分区
-                        await WritePartitionsUsingAdb(selectedPartitions, logTextBox, cancellationToken);
-                    }
-                    else if (currentConnectionType == "Fastboot")
-                    {
-                        // 使用 Fastboot 命令写入分区
-                        await WritePartitionsUsingFastboot(selectedPartitions, logTextBox, cancellationToken);
-                    }
-                    else
-                    {
-                        LogToFastboot("设备未连接或连接状态未知，请确保设备已连接并处于系统模式或Fastboot模式", "Red");
-                        return;
-                    }
-                    
-                }
-                catch (OperationCanceledException)
-                {
-                    LogFastbootVisualizationOperationStopped("写入分区");
-                }
-                catch (Exception ex)
-                {
-                    LogToFastboot($"写入分区失败: {ex.Message}", "Red");
-                }
-                finally
-                {
-                    EndFastbootVisualizationOperation(operationCancellation);
-                    if (shouldResumeDeviceDetection)
-                    {
-                        var simulatedStartButton = new System.Windows.Controls.Button
-                        {
-                            Content = "开始检测设备"
-                        };
-                        Button_Click_1(simulatedStartButton, new RoutedEventArgs());
-                        LogToFastboot("委托主页开始异步设备检测...Done", "Green");
-                    }
-                }
-            }
-        }
-
-        private async Task<string> ResolveConnectedFastbootSerialAsync(
-            CancellationToken cancellationToken = default)
-        {
-            string output = await GetCommandOutput(
-                GetFastbootPath(),
-                "devices",
-                cancellationToken);
-            List<string> connectedSerials = Regex.Matches(
-                    output ?? string.Empty,
-                    @"^\s*(?<serial>\S+)\s+fastboot\s*$",
-                    RegexOptions.IgnoreCase | RegexOptions.Multiline)
-                .Cast<Match>()
-                .Select(match => match.Groups["serial"].Value.Trim())
-                .Where(serial => !string.IsNullOrWhiteSpace(serial))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            string selectedSerial = GetSelectedDeviceSerial();
-            string? selectedConnectedSerial = connectedSerials.FirstOrDefault(serial =>
-                serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase));
-            if (!string.IsNullOrWhiteSpace(selectedConnectedSerial))
-            {
-                return selectedConnectedSerial;
-            }
-
-            return connectedSerials.Count == 1 ? connectedSerials[0] : string.Empty;
-        }
-
-        private async Task<(bool Available, string Reason)> CheckSlotAModeAvailabilityAsync(
-            string[] scriptLines,
-            CancellationToken cancellationToken = default)
-        {
-            bool scriptActivatesSlotA = scriptLines.Any(line =>
-                Regex.IsMatch(
-                    line,
-                    @"^\s*fastboot\b.*\bset_active\s+_?a\b",
-                    RegexOptions.IgnoreCase));
-            if (!scriptActivatesSlotA)
-            {
-                return (false, "BAT 脚本中未找到 set_active a，无法确认脚本面向 A/B 设备。");
-            }
-
-            string fastbootPath = GetToolPath("fastboot.exe");
-            if (string.IsNullOrWhiteSpace(fastbootPath))
-            {
-                return (false, "未找到 fastboot.exe，无法确认设备槽位类型。");
-            }
-
-            string selectedSerial = GetSelectedDeviceSerial();
-            string serialPrefix = string.IsNullOrWhiteSpace(selectedSerial)
-                ? string.Empty
-                : $"-s {selectedSerial} ";
-
-            string slotCountOutput = await GetCommandOutput(
-                fastbootPath,
-                $"{serialPrefix}getvar slot-count",
-                cancellationToken);
-            Match slotCountMatch = Regex.Match(
-                slotCountOutput ?? string.Empty,
-                @"\bslot-count\s*:\s*(\d+)\b",
-                RegexOptions.IgnoreCase);
-            if (slotCountMatch.Success &&
-                int.TryParse(slotCountMatch.Groups[1].Value, out int slotCount) &&
-                slotCount >= 2)
-            {
-                return (true, $"已确认设备支持 A/B 槽位（slot-count: {slotCount}）。");
-            }
-
-            string hasBootSlotOutput = await GetCommandOutput(
-                fastbootPath,
-                $"{serialPrefix}getvar has-slot:boot",
-                cancellationToken);
-            if (Regex.IsMatch(
-                    hasBootSlotOutput ?? string.Empty,
-                    @"\bhas-slot:boot\s*:\s*(?:yes|true)\b",
-                    RegexOptions.IgnoreCase))
-            {
-                return (true, "已确认 boot 分区支持 A/B 槽位。");
-            }
-
-            return (false, "设备未返回有效的双槽信息，出于安全考虑不可使用 Slot_A 模式。");
-        }
-
-        private XiaomiFlashMode? ShowXiaomiFlashModeDialog(bool slotAModeAvailable, string slotAModeReason)
-        {
-            var dialog = new System.Windows.Window
-            {
-                Title = "选择小米线刷模式",
-                Owner = this,
-                Width = 520,
-                SizeToContent = SizeToContent.Height,
-                ResizeMode = ResizeMode.NoResize,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                ShowInTaskbar = false,
-                Background = new SolidColorBrush(MediaColor.FromRgb(250, 251, 253))
-            };
-
-            var root = new System.Windows.Controls.StackPanel
-            {
-                Margin = new Thickness(22, 18, 22, 20)
-            };
-            root.Children.Add(new TextBlock
-            {
-                Text = "请选择本次刷写方式",
-                FontSize = 17,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(38, 49, 66)),
-                Margin = new Thickness(0, 0, 0, 5)
-            });
-            root.Children.Add(new TextBlock
-            {
-                Text = "模式只影响 BAT 中以 _ab 结尾的分区目标。",
-                FontSize = 12,
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(100, 116, 139)),
-                Margin = new Thickness(0, 0, 0, 16)
-            });
-
-            var traditionalRadio = new System.Windows.Controls.RadioButton
-            {
-                GroupName = "XiaomiFlashMode",
-                IsChecked = true,
-                Content = "传统模式",
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(51, 65, 85))
-            };
-            var traditionalCard = CreateXiaomiFlashModeCard(
-                traditionalRadio,
-                "严格按照官方 BAT 的分区目标执行，保留 _ab 刷写方式。",
-                true);
-            root.Children.Add(traditionalCard);
-
-            var slotARadio = new System.Windows.Controls.RadioButton
-            {
-                GroupName = "XiaomiFlashMode",
-                IsEnabled = slotAModeAvailable,
-                Content = "Slot_A 模式",
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(124, 58, 237)),
-                ToolTip = slotAModeReason
-            };
-            var slotACard = CreateXiaomiFlashModeCard(
-                slotARadio,
-                "Slot_A模式可以精简官方脚本多余步骤，缩短刷写时间",
-                slotAModeAvailable);
-            slotACard.Margin = new Thickness(0, 10, 0, 0);
-            root.Children.Add(slotACard);
-
-            root.Children.Add(new TextBlock
-            {
-                Text = slotAModeReason,
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 11,
-                Foreground = new SolidColorBrush(slotAModeAvailable
-                    ? MediaColor.FromRgb(22, 163, 74)
-                    : MediaColor.FromRgb(217, 119, 6)),
-                Margin = new Thickness(4, 9, 4, 0)
-            });
-
-            var buttons = new System.Windows.Controls.StackPanel
-            {
-                Orientation = System.Windows.Controls.Orientation.Horizontal,
-                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
-                Margin = new Thickness(0, 20, 0, 0)
-            };
-            var cancelButton = new System.Windows.Controls.Button
-            {
-                Content = "取消",
-                Width = 88,
-                Height = 32,
-                Margin = new Thickness(0, 0, 10, 0)
-            };
-            var startButton = new System.Windows.Controls.Button
-            {
-                Content = "开始刷写",
-                Width = 98,
-                Height = 32,
-                Background = new SolidColorBrush(MediaColor.FromRgb(196, 125, 232)),
-                BorderBrush = new SolidColorBrush(MediaColor.FromRgb(196, 125, 232)),
-                Foreground = System.Windows.Media.Brushes.White
-            };
-            cancelButton.Click += (_, _) => dialog.DialogResult = false;
-            startButton.Click += (_, _) => dialog.DialogResult = true;
-            buttons.Children.Add(cancelButton);
-            buttons.Children.Add(startButton);
-            root.Children.Add(buttons);
-            dialog.Content = root;
-
-            if (dialog.ShowDialog() != true)
-            {
-                return null;
-            }
-
-            return slotARadio.IsChecked == true
-                ? XiaomiFlashMode.SlotA
-                : XiaomiFlashMode.Traditional;
-        }
-
-        private static Border CreateXiaomiFlashModeCard(
-            System.Windows.Controls.RadioButton radioButton,
-            string description,
-            bool isEnabled)
-        {
-            var content = new System.Windows.Controls.StackPanel();
-            content.Children.Add(radioButton);
-            content.Children.Add(new TextBlock
-            {
-                Text = description,
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 12,
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(100, 116, 139)),
-                Margin = new Thickness(25, 7, 0, 0)
-            });
-
-            return new Border
-            {
-                Padding = new Thickness(14, 12, 14, 12),
-                CornerRadius = new CornerRadius(8),
-                BorderThickness = new Thickness(1),
-                BorderBrush = new SolidColorBrush(MediaColor.FromRgb(226, 232, 240)),
-                Background = new SolidColorBrush(isEnabled
-                    ? MediaColor.FromRgb(255, 255, 255)
-                    : MediaColor.FromRgb(245, 246, 248)),
-                Child = content
-            };
-        }
-        
-        private async Task WritePartitionsUsingAdb(
-            List<PartitionInfo> selectedPartitions,
-            System.Windows.Controls.RichTextBox logTextBox,
-            CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            string adbPath = GetToolPath("adb.exe");
-            if (string.IsNullOrEmpty(adbPath))
-            {
-                LogToFastboot("未找到adb工具", "Red");
-                return;
-            }
-            
-            // 与ADB回读使用相同的设备连接及ROOT授权日志样式。
-            var device = await ResolveRootAdbDeviceAsync(adbPath);
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!device.Success)
-            {
-                LogToFastboot(device.Error, "Red");
-                return;
-            }
-
-            LogToFastbootStyled(
-                ("连接设备...", "Black", false),
-                ($"[{device.Serial}]", "Purple", true));
-            LogToFastbootStyled(
-                ("已授予 ", "Black", false),
-                ("Shell ROOT", "Blue", true),
-                (" 权限", "Black", false));
-            
-            // 创建Download目录
-            await ExecuteAdbCommandWithOutput(
-                "shell su -c 'mkdir -p /sdcard/Download'",
-                cancellationToken);
-
-            long totalBytesToPush = selectedPartitions.Sum(partition => Math.Max(1, GetExistingFileSize(partition.FilePath)));
-            if (totalBytesToPush <= 0)
-            {
-                totalBytesToPush = Math.Max(1, selectedPartitions.Count);
-            }
-
-            long completedPushBytes = 0;
-            _transferStartTime = DateTime.Now;
-            ResetOperationTransferDisplay();
-            
-            Stopwatch partitionWriteStopwatch = Stopwatch.StartNew();
-            bool allWritesSucceeded = true;
-            int failedPartitionCount = 0;
-            foreach (var partition in selectedPartitions)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                string renamedFileName = $"{partition.PartitionName}.img";
-                bool stepFinished = false;
-                string deviceDownloadPath = $"/sdcard/Download/{renamedFileName}";
-                try
-                {
-                    // 将文件重命名为分区名称并推送到设备Download目录
-                    LogFastbootWriteBegin(renamedFileName, partition.PartitionName);
-                    long currentFileSize = Math.Max(1, GetExistingFileSize(partition.FilePath));
-                    long completedBytesBeforeCurrent = completedPushBytes;
-                    Stopwatch transferStopwatch = Stopwatch.StartNew();
-                    double? lastSmoothedSpeed = null;
-                    
-                    string pushResult;
-                    try
-                    {
-                        await ExecuteAdbSyncPushAsync(
-                            partition.FilePath,
-                            deviceDownloadPath,
-                            (sentBytes, currentFileTotalBytes) =>
-                            {
-                                long safeCurrentFileTotalBytes = Math.Max(1, currentFileTotalBytes);
-                                long transferredBytes = completedBytesBeforeCurrent + Math.Min(safeCurrentFileTotalBytes, sentBytes);
-                                SetOperationTransferProgress(CalculateTransferPercent(transferredBytes, totalBytesToPush));
-                                SetOperationTransferSpeed(CalculateTransferSpeed(transferStopwatch, sentBytes, ref lastSmoothedSpeed));
-                                UpdateOperationTransferElapsed();
-                            },
-                            cancellationToken: CancellationToken.None);
-
-                        completedPushBytes += currentFileSize;
-                        SetOperationTransferProgress(CalculateTransferPercent(completedPushBytes, totalBytesToPush));
-                        UpdateOperationTransferElapsed();
-                        pushResult = "success";
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        pushResult = $"failed: {ex.Message}";
-                    }
-
-                    if (pushResult.Contains("failed") || pushResult.Contains("error"))
-                    {
-                        LogFastbootWriteEndFail(partition.PartitionName, renamedFileName);
-                        stepFinished = true;
-                        LogToFastboot(pushResult.Trim(), "Red");
-                        allWritesSucceeded = false;
-                        failedPartitionCount++;
-                        continue;
-                    }
-                    
-                    // 使用dd命令将Download目录中的文件写入到分区
-                    string partitionPath = $"/dev/block/by-name/{partition.PartitionName}";
-                    string ddCommand = $"shell su -c 'dd if={deviceDownloadPath} of={partitionPath} bs=4096'";
-                    string ddResult = await ExecuteAdbCommandWithOutput(ddCommand, CancellationToken.None);
-                    
-                    if (ddResult.Contains("records in") && ddResult.Contains("records out"))
-                    {
-                        LogFastbootWriteEndOk(partition.PartitionName, renamedFileName);
-                        stepFinished = true;
-                    }
-                    else if (ddResult.Contains("Permission denied") || ddResult.Contains("Operation not permitted"))
-                    {
-                        LogFastbootWriteEndFail(partition.PartitionName, renamedFileName);
-                        stepFinished = true;
-                        LogToFastboot($"分区 {partition.PartitionName} 写入失败: 权限不足", "Red");
-                        allWritesSucceeded = false;
-                        failedPartitionCount++;
-                    }
-                    else if (ddResult.Contains("No such file or directory"))
-                    {
-                        LogFastbootWriteEndFail(partition.PartitionName, renamedFileName);
-                        stepFinished = true;
-                        LogToFastboot($"分区 {partition.PartitionName} 不存在或路径错误", "Red");
-                        allWritesSucceeded = false;
-                        failedPartitionCount++;
-                    }
-                    else
-                    {
-                        LogFastbootWriteEndFail(partition.PartitionName, renamedFileName);
-                        stepFinished = true;
-                        LogToFastboot($"分区 {partition.PartitionName} 写入结果未知: {ddResult}", "Yellow");
-                        allWritesSucceeded = false;
-                        failedPartitionCount++;
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    if (!stepFinished)
-                    {
-                        LogFastbootWriteEndFail(partition.PartitionName, renamedFileName);
-                    }
-                    LogToFastboot($"写入分区 {partition.PartitionName} 失败: {ex.Message}", "Red");
-                    allWritesSucceeded = false;
-                    failedPartitionCount++;
-                }
-                finally
-                {
-                    await CleanupAdbTemporaryFileAsync(deviceDownloadPath);
-                }
-            }
-
-            if (selectedPartitions.Count > 0 && completedPushBytes >= totalBytesToPush)
-            {
-                CompleteOperationTransferDisplay();
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            long elapsedSeconds = Math.Max(0, (long)Math.Ceiling(partitionWriteStopwatch.Elapsed.TotalSeconds));
-            LogToFastboot(
-                $"写入完成，写入失败分区{failedPartitionCount}个，耗时{elapsedSeconds}秒",
-                allWritesSucceeded ? "Green" : "Orange");
-
-            // 当前设备仍处于 Android 系统模式，自动重启必须使用 adb reboot。
-            if (RestartCheckBox.IsChecked == true)
-            {
-                string rebootResult = await ExecuteAdbCommandWithOutput("reboot", cancellationToken);
-                bool rebootFailed = Regex.IsMatch(
-                    rebootResult ?? string.Empty,
-                    @"\b(?:error|failed|failure|offline|unauthorized)\b|no devices",
-                    RegexOptions.IgnoreCase);
-                if (rebootFailed)
-                {
-                    LogToFastbootStyled(
-                        ("重启设备", "Black", false),
-                        ("...Error", "Red", true));
-                    if (!string.IsNullOrWhiteSpace(rebootResult))
-                    {
-                        LogToFastboot(rebootResult.Trim(), "Red");
-                    }
-                }
-                else
-                {
-                    LogToFastbootStyled(
-                        ("重启设备", "Black", false),
-                        ("...OK", "Green", true));
-                }
-            }
-        }
-        
-        private async Task WritePartitionsUsingFastboot(
-            List<PartitionInfo> selectedPartitions,
-            System.Windows.Controls.RichTextBox logTextBox,
-            CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            string fastbootPath = GetFastbootPath();
-            if (string.IsNullOrEmpty(fastbootPath))
-            {
-                LogToFastboot("未找到fastboot工具", "Red");
-                return;
-            }
-            
-            // 重置进度条
-            ResetOperationProgressBar();
-            
-            bool allFlashesSucceeded = true;
-            foreach (var partition in selectedPartitions)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                // 获取显示用的分区名称（移除_ab后缀）
-                string displayPartitionName = GetDisplayPartitionName(partition.PartitionName);
-                
-                // 重置进度条为当前分区
-                ResetOperationProgressBar();
-                
-                string flashCommand = $"fastboot flash {partition.PartitionName} \"{partition.FilePath}\"";
-                string sourceFileName = Path.GetFileName(partition.FilePath);
-                bool flashSucceeded = await ExecuteFastbootCommandFromScriptWithCustomLog(
-                    flashCommand,
-                    "",
-                    fastbootPath,
-                    logTextBox,
-                    partition.PartitionName,
-                    sourceFileName,
-                    cancellationToken: CancellationToken.None);
-                if (!flashSucceeded)
-                {
-                    allFlashesSucceeded = false;
-                    LogToFastboot($"分区 {partition.PartitionName} 刷写失败，已跳过并继续下一个分区", "Red");
-                }
-            }
-            cancellationToken.ThrowIfCancellationRequested();
-            await ExecutePostFlashCommands(
-                fastbootPath,
-                logTextBox,
-                allowBootloaderLock: false,
-                allowScriptOnlyActions: HasActiveParsedRawProgram() &&
-                                        string.Equals(
-                                            BottomConnectionTypeText?.Text,
-                                            "Fastboot",
-                                            StringComparison.OrdinalIgnoreCase),
-                cancellationToken: cancellationToken);
-        }
-
-        private async Task CleanupAdbTemporaryFileAsync(string remotePath)
-        {
-            if (string.IsNullOrWhiteSpace(remotePath))
-            {
-                return;
-            }
-
-            try
-            {
-                await ExecuteAdbCommandWithOutput($"shell rm -f \"{remotePath}\"");
-            }
-            catch (Exception ex)
-            {
-                LogToFastboot($"清理设备临时文件失败：{remotePath}，{ex.Message}", "Yellow");
-            }
-        }
-
-        private async void BackupBasebandButton_Click(object sender, RoutedEventArgs e)
-        {
-            var logTextBox = this.FindName("FastbootLogTextBox") as System.Windows.Controls.RichTextBox;
-            var dataGrid = this.FindName("PartitionTableDataGrid") as DataGrid;
-            var partitionInfos = dataGrid?.ItemsSource as ObservableCollection<PartitionInfo>;
-            CancellationTokenSource? operationCancellation = null;
-            
-            if (logTextBox == null)
-            {
-                System.Windows.MessageBox.Show("发生内部错误：找不到日志文本框。");
-                return;
-            }
-
-            LogToFastboot("开始备份字库（所有分区）...", "Black");
-
-            if (GetRawLocalizedText(BottomConnectionTypeText) != "系统")
-            {
-                LogToFastboot("设备未处于系统模式，请在系统模式下执行此操作", "Red");
-                return;
-            }
-
-            string adbPath = GetAdbPath();
-            if (string.IsNullOrEmpty(adbPath))
-            {
-                LogToFastboot("未找到ADB工具", "Red");
-                return;
-            }
-
-            // 检查root权限
-            string suResult = await ExecuteAdbCommandWithOutput("shell su -c \"echo success\"");
-            if (!suResult.Contains("success"))
-            {
-                LogToFastboot("设备没有root权限，无法执行备份", "Red");
-                return;
-            }
-
-            // 获取分区表信息
-            List<string> partitionsToBackup = new List<string>();
-            
-            if (partitionInfos != null && partitionInfos.Count > 0)
-            {
-                // 从分区表DataGrid获取所有分区名称，但跳过userdata分区
-                foreach (var partition in partitionInfos)
-                {
-                    if (!string.IsNullOrEmpty(partition.PartitionName))
-                    {
-                        // 跳过userdata分区
-                        if (partition.PartitionName.ToLower() == "userdata")
-                        {
-                            LogToFastboot($"跳过userdata分区（用户数据分区）", "Red");
-                            continue;
-                        }
-                        partitionsToBackup.Add(partition.PartitionName);
-                    }
-                }
-                LogToFastboot($"从分区表获取到 {partitionsToBackup.Count} 个分区（已跳过userdata）", "Black");
-            }
-            else
-            {
-                LogToFastboot("未找到分区表信息，请先读取分区表", "Red");
-                return;
-            }
-
-            string? outputExtension = ShowPartitionBackupFormatDialog("备份字库");
-            if (string.IsNullOrWhiteSpace(outputExtension))
-            {
-                LogToFastboot("用户取消了备份字库", "Yellow");
-                return;
-            }
-
-            string baseDirectory = SelectSaveDirectory("请选择保存字库备份的目录");
-            if (string.IsNullOrWhiteSpace(baseDirectory))
-            {
-                LogToFastboot("用户取消了选择保存目录", "Yellow");
-                return;
-            }
-
-            string backupDir = System.IO.Path.Combine(baseDirectory, $"SmartTool_{DateTime.Now:yyyyMMdd_HHmmss}");
-            try
-            {
-                System.IO.Directory.CreateDirectory(backupDir);
-            }
-            catch (Exception ex)
-            {
-                LogToFastboot($"创建备份目录失败：{ex.Message}", "Red");
-                return;
-            }
-
-            LogToFastboot($"备份文件将保存在：{backupDir}", "Black");
-
-            operationCancellation = BeginFastbootVisualizationOperation();
-            CancellationToken cancellationToken = operationCancellation.Token;
-            try
-            {
-            bool allSucceeded = true;
-            int successCount = 0;
-            var successfullyBackedUpImages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            ResetOperationTransferDisplay();
-
-            foreach (string partition in partitionsToBackup)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                // 如果是super分区，提醒用户该分区文件较大
-                if (partition.ToLower() == "super")
-                {
-                    LogToFastboot($"注意：super分区文件较大，请耐心等待...", "Red");
-                }
-
-                LogFastbootReadBegin(partition);
-
-                string devicePath = $"/sdcard/Download/{partition}.img";
-                string localPath = System.IO.Path.Combine(backupDir, $"{partition}{outputExtension}");
-                string partitionPath = $"/dev/block/bootdevice/by-name/{partition}";
-
-                // 使用dd命令读取分区
-                string ddCommand = $"shell su -c \"dd if={partitionPath} of={devicePath} bs=4096\"";
-                string ddResult = await ExecuteAdbCommandWithOutput(ddCommand, cancellationToken);
-
-                if (ddResult.Contains("error") || ddResult.Contains("failed") || ddResult.Contains("not found"))
-                {
-                    LogFastbootReadEndFail(partition);
-                    if (!string.IsNullOrWhiteSpace(ddResult))
-                    {
-                        LogToFastboot(ddResult.Trim(), "Red");
-                    }
-                    await CleanupAdbTemporaryFileAsync(devicePath);
-                    allSucceeded = false;
-                    continue;
-                }
-
-                // 使用adb pull将文件从设备拉到电脑
-                long currentPartitionBytes = await ResolvePartitionTransferSizeAsync(
-                    devicePath,
-                    partitionInfos?.FirstOrDefault(p => p.PartitionName == partition)?.PartitionSize);
-                _transferStartTime = DateTime.Now;
-                ResetOperationTransferDisplay();
-                Stopwatch transferStopwatch = Stopwatch.StartNew();
-                double? lastSmoothedSpeed = null;
-                string pullResult;
-
-                try
-                {
-                    await ExecuteAdbSyncPullAsync(
-                        devicePath,
-                        localPath,
-                        (receivedBytes, currentFileTotalBytes) =>
-                        {
-                            long safeCurrentFileTotalBytes = currentFileTotalBytes > 0 ? currentFileTotalBytes : currentPartitionBytes;
-                            long transferredBytes = Math.Min(safeCurrentFileTotalBytes, receivedBytes);
-                            SetOperationTransferProgress(CalculateTransferPercent(transferredBytes, safeCurrentFileTotalBytes));
-                            SetOperationTransferSpeed(CalculateTransferSpeed(transferStopwatch, receivedBytes, ref lastSmoothedSpeed));
-                            UpdateOperationTransferElapsed();
-                        },
-                        currentPartitionBytes,
-                        cancellationToken);
-
-                    SetOperationTransferProgress(100);
-                    UpdateOperationTransferElapsed();
-                    pullResult = "success";
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    pullResult = $"failed: {ex.Message}";
-                }
-
-                if (pullResult.Contains("error") || pullResult.Contains("failed"))
-                {
-                    LogFastbootReadEndFail(partition);
-                    if (!string.IsNullOrWhiteSpace(pullResult))
-                    {
-                        LogToFastboot(pullResult.Trim(), "Red");
-                    }
-                    allSucceeded = false;
-                }
-                else
-                {
-                    LogFastbootReadEndOk(partition);
-                    successCount++;
-                    successfullyBackedUpImages[partition] = localPath;
-                }
-
-                // 删除设备上的临时文件
-                await CleanupAdbTemporaryFileAsync(devicePath);
-            }
-
-            await TryGenerateRawProgramXmlAsync(
-                adbPath,
-                backupDir,
-                successfullyBackedUpImages,
-                cancellationToken);
-
-            if (allSucceeded)
-            {
-                if (partitionsToBackup.Count > 0)
-                {
-                    CompleteOperationTransferDisplay();
-                }
-                LogToFastbootStyled(
-                    ("字库备份完成，共计", "Black", false),
-                    ($"{successCount}", "Purple", true),
-                    ("个分区.", "Black", false));
-                LogToFastbootStyled(
-                    ("保存路径：", "Black", false),
-                    (backupDir, "Blue", false));
-            }
-            else
-            {
-                LogToFastboot($"字库备份完成，成功备份 {successCount}/{partitionsToBackup.Count} 个分区，请检查日志", "Red");
-            }
-
-            try
-            {
-                if (Directory.Exists(backupDir))
-                {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "explorer.exe",
-                        Arguments = $"\"{backupDir}\"",
-                        UseShellExecute = true
-                    });
-                }
-
-            }
-            catch
-            {
-     
-            }
-            }
-            catch (OperationCanceledException)
-            {
-                LogFastbootVisualizationOperationStopped("备份字库");
-            }
-            finally
-            {
-                EndFastbootVisualizationOperation(operationCancellation);
-            }
-        }
-        
-        private List<PartitionInfo> ParsePartitionInfo(string fastbootOutput)
-        {
-            var partitions = new List<PartitionInfo>();
-            var lines = fastbootOutput.Split('\n');
-            
-            foreach (var line in lines)
-            {
-                // 匹配分区相关的变量
-                if (line.Contains("partition-size:") || line.Contains("partition-type:"))
-                {
-                    var match = Regex.Match(line, @"(partition-size|partition-type):([^:]+):\s*(.+)");
-                    if (match.Success)
-                    {
-                        string varType = match.Groups[1].Value;
-                        string partitionName = match.Groups[2].Value.Trim();
-                        string value = match.Groups[3].Value.Trim();
-                        
-                        // 查找是否已存在该分区
-                        var existingPartition = partitions.FirstOrDefault(p => p.PartitionName == partitionName);
-                        if (existingPartition == null)
-                        {
-                            existingPartition = new PartitionInfo { PartitionName = partitionName };
-                            partitions.Add(existingPartition);
-                        }
-                        
-                        if (varType == "partition-size")
-                        {
-                            existingPartition.PartitionSize = FormatSize(value);
-                        }
-                        else if (varType == "partition-type")
-                        {
-                            existingPartition.PartitionType = value;
-                        }
-                    }
-                }
-                // 匹配其他分区相关信息
-                else if (line.Contains(":") && (line.Contains("partition") || line.Contains("slot")))
-                {
-                    var parts = line.Split(':');
-                    if (parts.Length >= 2)
-                    {
-                        string key = parts[0].Trim();
-                        string value = string.Join(":", parts.Skip(1)).Trim();
-                        
-                        // 提取分区名称
-                        var partitionMatch = Regex.Match(key, @"([a-zA-Z0-9_-]+)$");
-                        if (partitionMatch.Success && !string.IsNullOrEmpty(value))
-                        {
-                            string partitionName = partitionMatch.Groups[1].Value;
-                            
-                            // 过滤掉一些非分区信息
-                            if (!IsValidPartitionName(partitionName))
-                                continue;
-                                
-                            var existingPartition = partitions.FirstOrDefault(p => p.PartitionName == partitionName);
-                            if (existingPartition == null)
-                            {
-                                existingPartition = new PartitionInfo { PartitionName = partitionName };
-                                partitions.Add(existingPartition);
-                            }
-                            
-                            if (string.IsNullOrEmpty(existingPartition.AdditionalInfo))
-                            {
-                                existingPartition.AdditionalInfo = $"{key}: {value}";
-                            }
-                            else
-                            {
-                                existingPartition.AdditionalInfo += $"; {key}: {value}";
-                            }
-                        }
-                    }
-                }
-            }
-            
-            return partitions.OrderBy(p => p.PartitionName).ToList();
-        }
-        
         private bool IsValidPartitionName(string name)
         {
             // 常见的Android分区名称
@@ -12758,88 +7019,7 @@ namespace WpfApp1
                 return Path.Combine(appDirectory, "platform-tools", "adb.exe");
             }
         }
-        
-        private List<PartitionInfo> ParseAdbPartitionInfo(string adbOutput)
-        {
-            var partitions = new Dictionary<string, PartitionInfo>(StringComparer.OrdinalIgnoreCase);
-            var lines = adbOutput.Split('\n');
-            
-            foreach (var line in lines)
-            {
-                var trimmedLine = line.Trim();
-                if (string.IsNullOrEmpty(trimmedLine) ||
-                    trimmedLine.StartsWith("total", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
 
-                // 首选新格式：partitionName|sizeInBytes|resolvedDevicePath
-                string[] stableParts = trimmedLine.Split('|', 3, StringSplitOptions.None);
-                if (stableParts.Length == 3)
-                {
-                    string partitionName = stableParts[0].Trim();
-                    string sizeText = stableParts[1].Trim();
-                    string devicePath = stableParts[2].Trim();
-                    if (!Regex.IsMatch(partitionName, @"^[A-Za-z0-9._-]+$"))
-                    {
-                        continue;
-                    }
-
-                    long.TryParse(sizeText, System.Globalization.NumberStyles.Integer,
-                        System.Globalization.CultureInfo.InvariantCulture, out long sizeBytes);
-                    partitions[partitionName] = new PartitionInfo
-                    {
-                        PartitionName = partitionName,
-                        PartitionSize = sizeBytes > 0 ? FormatByteSize(sizeBytes) : "--",
-                        PartitionType = "Block",
-                        AdditionalInfo = $"Device: {devicePath}"
-                    };
-                    continue;
-                }
-
-                // 兼容旧的 ls -l 输出：只依赖“名称 -> 目标”，不再依赖日期字段位置。
-                Match symlinkMatch = Regex.Match(trimmedLine, @"^(?<left>.+?)\s+->\s+(?<target>\S+)\s*$");
-                if (!symlinkMatch.Success)
-                {
-                    continue;
-                }
-
-                string[] leftParts = symlinkMatch.Groups["left"].Value
-                    .Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                if (leftParts.Length == 0)
-                {
-                    continue;
-                }
-
-                string fallbackPartitionName = leftParts[^1];
-                if (!Regex.IsMatch(fallbackPartitionName, @"^[A-Za-z0-9._-]+$"))
-                {
-                    continue;
-                }
-
-                partitions[fallbackPartitionName] = new PartitionInfo
-                {
-                    PartitionName = fallbackPartitionName,
-                    PartitionSize = "--",
-                    PartitionType = "Block",
-                    AdditionalInfo = $"Device: {symlinkMatch.Groups["target"].Value}"
-                };
-            }
-            
-            return partitions.Values.OrderBy(p => p.PartitionName).ToList();
-        }
-
-        private void FastbootLogTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void FastbootLogTextBox_TextChanged_1(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        // 选择小米刷机包文件夹
         private void SelectXiaomiFlashScriptButton_Click(object sender, RoutedEventArgs e)
         {
             var folderDialog = new System.Windows.Forms.FolderBrowserDialog
@@ -13680,12 +7860,6 @@ if (startXiaomiFlashButton != null)
             }
         }
 
-        private void AddDownloadLogMessage(string level, string message)
-        {
-            AddLogMessage(level, message);
-        }
-        
-        // 辅助方法：查找可视化子元素
         private T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
         {
             for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
@@ -13705,247 +7879,6 @@ if (startXiaomiFlashButton != null)
             return null;
         }
 
-
-
-        private void OfficialMaskComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-
-        }
-
-        private void txtBootPath_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void CheckBox10_Checked(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void BatteryControl_Loaded(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void RichTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void CheckBox_Checked_3()
-        {
-
-        }
-
-        private void CheckBox_Checked_4()
-        {
-
-        }
-
-        private void FastbootLogTextBox_TextChanged_3(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void TextBox_TextChanged_6(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void CheckBox_Checked_5(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void EdlSkipDataCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void EdlGenerateProgramCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void EdlSkipDataCheckBox_Checked_1(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void CheckBox_Checked_6(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void CheckBox_Checked_7(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-
-        private void CheckBox_Checked_8(object sender, RoutedEventArgs e)
-        {
-
-        }
-
-        private void txtLog_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void AvbInitBootPathTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-        private void LogBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-
-        }
-
-
-    }
-
-    // 文件项数据模型
-    public class FileItem : System.ComponentModel.INotifyPropertyChanged
-    {
-        private ImageSource? _previewImage;
-
-        public string Name { get; set; } = "";
-        public string TimeText { get; set; } = "";
-        public bool IsPlaceholder { get; set; }
-        public bool IsFile { get; set; }
-        public bool IsArchive { get; set; }
-        public bool IsImageFile { get; set; }
-        public bool IsPreviewableImage { get; set; }
-        public ImageSource? PreviewImage
-        {
-            get => _previewImage;
-            set
-            {
-                if (ReferenceEquals(_previewImage, value))
-                {
-                    return;
-                }
-
-                _previewImage = value;
-                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(PreviewImage)));
-                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(HasImagePreview)));
-            }
-        }
-
-        public bool HasImagePreview => PreviewImage != null;
-
-        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
-    }
-
-    // 分区信息数据模型
-    public class PartitionInfo : System.ComponentModel.INotifyPropertyChanged
-    {
-        private bool isSelected;
-        private string partitionName = "";
-        private string partitionSize = "--";
-        private string partitionType = "--";
-        private string filePath = "";
-        private string additionalInfo = "--";
-
-        public bool IsSelected
-        {
-            get { return isSelected; }
-            set
-            {
-                if (isSelected != value)
-                {
-                    isSelected = value;
-                    OnPropertyChanged(nameof(IsSelected));
-                }
-            }
-        }
-
-        public string PartitionName
-        {
-            get { return partitionName; }
-            set
-            {
-                if (partitionName != value)
-                {
-                    partitionName = value;
-                    OnPropertyChanged(nameof(PartitionName));
-                    OnPropertyChanged(nameof(IsBasebandFingerprintProtected));
-                    OnPropertyChanged(nameof(IsAdbDataProtected));
-                }
-            }
-        }
-
-        public bool IsBasebandFingerprintProtected =>
-            MainWindow.IsFastbootVisualizationBasebandProtectedPartitionLabel(PartitionName);
-
-        public bool IsAdbDataProtected =>
-            MainWindow.IsEdlDataPartitionLabel(PartitionName);
-
-        public string PartitionSize
-        {
-            get { return partitionSize; }
-            set
-            {
-                if (partitionSize != value)
-                {
-                    partitionSize = value;
-                    OnPropertyChanged(nameof(PartitionSize));
-                }
-            }
-        }
-
-        public string PartitionType
-        {
-            get { return partitionType; }
-            set
-            {
-                if (partitionType != value)
-                {
-                    partitionType = value;
-                    OnPropertyChanged(nameof(PartitionType));
-                }
-            }
-        }
-
-        public string FilePath
-        {
-            get { return filePath; }
-            set
-            {
-                if (filePath != value)
-                {
-                    filePath = value;
-                    OnPropertyChanged(nameof(FilePath));
-                }
-            }
-        }
-
-        public string AdditionalInfo
-        {
-            get { return additionalInfo; }
-            set
-            {
-                if (additionalInfo != value)
-                {
-                    additionalInfo = value;
-                    OnPropertyChanged(nameof(AdditionalInfo));
-                }
-            }
-        }
-
-        public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
-
-        protected virtual void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
-        }
-    }
-    
-    // CPU代号到名称的映射方法
-public partial class MainWindow : Window
-    {
         private void SocialMediaButton_Click(object sender, RoutedEventArgs e)
         {
             if (sender is System.Windows.Controls.Button button && button.Tag is string url)
@@ -13966,63 +7899,131 @@ public partial class MainWindow : Window
         }
     private string GetCpuNameByCode(string cpuCode)
     {
-        if (string.IsNullOrEmpty(cpuCode) || cpuCode == "--" || cpuCode == "--")
+        if (string.IsNullOrEmpty(cpuCode) || cpuCode == "--")
         {
             return "--";
         }
         
+        string cleanCode = cpuCode.Trim().ToUpperInvariant();
+        var match = Regex.Match(cleanCode, @"[A-Z0-9\-]+");
+        if (match.Success) cleanCode = match.Value;
+
         var cpuMapping = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            // 骁龙系列
-            { "SM4375", "骁龙4 Gen 1" },
-            { "SM4450", "骁龙4 Gen 2" },
-            { "SM4635", "骁龙4s Gen 2" },
-            { "SM6450", "骁龙6 Gen 1" },
-            { "SM6475-AB", "骁龙6 Gen 3" },
-            { "SM6650", "骁龙6 Gen 4" },
-            { "SM7435-AB", "骁龙7s Gen 2" },
-            { "SM7475-AB", "骁龙7+ Gen 2" },
-            { "SM7675", "骁龙7+ Gen 3" },
-            { "SM8450", "骁龙8 Gen 1" },
-            { "SM8475", "骁龙8+ Gen 1" },
-            { "SM8550", "骁龙8 Gen 2" },
-            { "SM8635", "骁龙8s Gen 3" },
-            { "SM8650", "骁龙8 Gen 3" },
-            { "SM8750", "骁龙8至尊 (Elite)" },
-            { "SM8850", "骁龙8至尊2 (Elite 2)" },
-            { "SM8850s", "骁龙8至尊2s (Elite 2s)" },
-            { "MSM8998", "骁龙835" },
-            { "SDM845", "骁龙845" },
-            { "SM8150", "骁龙855" },
-            { "SM8250", "骁龙865" },
+            // 高通骁龙旗舰与高端
+            { "SM8850", "第二代骁龙8 至尊版 (Elite Gen 2)" },
+            { "SM8850S", "第二代骁龙8 至尊版 降频版" },
+            { "SM8750", "骁龙8 至尊版 (Snapdragon 8 Elite)" },
+            { "SM8750-AB", "骁龙8 至尊版" },
+            { "SM8650", "第三代骁龙8 (8 Gen 3)" },
+            { "SM8650-AB", "第三代骁龙8 (8 Gen 3)" },
+            { "SM8635", "第三代骁龙8s (8s Gen 3)" },
+            { "SM8550", "第二代骁龙8 (8 Gen 2)" },
+            { "SM8550-AB", "第二代骁龙8 (8 Gen 2)" },
+            { "SM8550-AC", "第二代骁龙8 领先版" },
+            { "SM8475", "第一代骁龙8+ (8+ Gen 1)" },
+            { "SM8450", "第一代骁龙8 (8 Gen 1)" },
             { "SM8350", "骁龙888" },
-            { "SDM710", "骁龙710" },
-            { "SM7250-AB", "骁龙765G" },
+            { "SM8350-AC", "骁龙888+" },
+            { "SM8250", "骁龙865" },
+            { "SM8250-AC", "骁龙870" },
+            { "SM8150", "骁龙855" },
+            { "SM8150-AC", "骁龙855+" },
+            { "SDM845", "骁龙845" },
+            { "MSM8998", "骁龙835" },
+            { "MSM8996", "骁龙820/821" },
+
+            // 高通骁龙 7 系列
+            { "SM7675", "第三代骁龙7+ (7+ Gen 3)" },
+            { "SM7550", "第三代骁龙7 (7 Gen 3)" },
+            { "SM7475", "第二代骁龙7+ (7+ Gen 2)" },
+            { "SM7475-AB", "第二代骁龙7+ (7+ Gen 2)" },
+            { "SM7450", "第一代骁龙7 (7 Gen 1)" },
+            { "SM7435-AB", "第二代骁龙7s (7s Gen 2)" },
             { "SM7325", "骁龙778G" },
-            { "MSM8953", "骁龙625" },
-            { "SDM660", "骁龙660" },
+            { "SM7325-AE", "骁龙778G+" },
+            { "SM7315", "骁龙782G" },
+            { "SM7250", "骁龙765G" },
+            { "SM7250-AB", "骁龙765G" },
+            { "SM7225", "骁龙750G" },
+            { "SM7150", "骁龙730/730G" },
+            { "SM7125", "骁龙720G" },
+            { "SDM710", "骁龙710" },
+
+            // 高通骁龙 6 / 4 系列
+            { "SM6650", "第四代骁龙6 (6 Gen 4)" },
+            { "SM6475", "第三代骁龙6 (6 Gen 3)" },
+            { "SM6475-AB", "第三代骁龙6 (6 Gen 3)" },
+            { "SM6450", "第一代骁龙6 (6 Gen 1)" },
+            { "SM6375", "骁龙695" },
             { "SM6350", "骁龙690" },
-            
-            // 天玑系列
-            { "MT6833", "天玑700/6020/6100+" },
-            { "MT6853", "天玑720" },
-            { "MT6873", "天玑800" },
-            { "MT6853T", "天玑800U" },
-            { "MT6877TT", "天玑1080/7050" },
-            { "MT6891", "天玑1100/8020" },
-            { "MT6893", "天玑1200" },
-            { "MT6893Z", "天玑1300/8050" },
-            { "MT6895T", "天玑8100" },
-            { "MT6896", "天玑8200" },
-            { "MT6897", "天玑8300" },
-            { "MT6899", "天玑8400" },
-            { "MT6983", "天玑9000" },
-            { "MT6985", "天玑9200" },
-            { "MT6989", "天玑9300" },
-            { "MT6991", "天玑9400" }
+            { "SM6225", "骁龙680" },
+            { "SM6115", "骁龙662" },
+            { "SDM660", "骁龙660" },
+            { "MSM8953", "骁龙625" },
+            { "SM4635", "第二代骁龙4s (4s Gen 2)" },
+            { "SM4450", "第二代骁龙4 (4 Gen 2)" },
+            { "SM4375", "第一代骁龙4 (4 Gen 1)" },
+            { "SM4350", "骁龙480" },
+            { "SM4350-AC", "骁龙480+" },
+
+            // 联发科天玑系列
+            { "MT6991", "天玑 9400" },
+            { "MT6989", "天玑 9300 / 9300+" },
+            { "MT6985", "天玑 9200 / 9200+" },
+            { "MT6983", "天玑 9000 / 9000+" },
+            { "MT6897", "天玑 8300 / 8300-Ultra" },
+            { "MT6896", "天玑 8200 / 8200-Ultra" },
+            { "MT6895", "天玑 8100" },
+            { "MT6895T", "天玑 8100-MAX" },
+            { "MT6893", "天玑 1200" },
+            { "MT6893Z", "天玑 1300 / 8050" },
+            { "MT6891", "天玑 1100 / 8020" },
+            { "MT6879", "天玑 8000" },
+            { "MT6877", "天玑 1080 / 7050" },
+            { "MT6877TT", "天玑 1080 / 7050" },
+            { "MT6875", "天玑 820" },
+            { "MT6873", "天玑 800" },
+            { "MT6853", "天玑 720" },
+            { "MT6853T", "天玑 800U" },
+            { "MT6835", "天玑 6100+" },
+            { "MT6833", "天玑 700 / 6020" },
+            { "MT6789", "Helio G99" },
+            { "MT6785", "Helio G90/G95" },
+            { "MT6769", "Helio G80/G85" },
+            { "MT6765", "Helio P35 / G35" },
+
+            // 华为海思麒麟
+            { "HI36A0", "麒麟 9000S / 9010" },
+            { "HI3690", "麒麟 990" },
+            { "HI3680", "麒麟 980" },
+            { "HI3670", "麒麟 970" },
+            { "HI3660", "麒麟 960" },
+            { "HI6260", "麒麟 9000SL / 9000E" },
+            { "HI6250", "麒麟 650/655/658/659" },
+
+            // 谷歌 Tensor
+            { "GS101", "Google Tensor" },
+            { "GS201", "Google Tensor G2" },
+            { "ZUMA", "Google Tensor G3" },
+            { "ZUMA-PRO", "Google Tensor G4" }
         };
-        
-        return cpuMapping.TryGetValue(cpuCode, out string cpuName) ? cpuName : "未知";
+
+        if (cpuMapping.TryGetValue(cleanCode, out string? name))
+        {
+            return name;
+        }
+
+        // 智能推断未在表中的芯片系列
+        if (cleanCode.StartsWith("SM8")) return $"高通骁龙 8系列 ({cleanCode})";
+        if (cleanCode.StartsWith("SM7")) return $"高通骁龙 7系列 ({cleanCode})";
+        if (cleanCode.StartsWith("SM6")) return $"高通骁龙 6系列 ({cleanCode})";
+        if (cleanCode.StartsWith("SM4")) return $"高通骁龙 4系列 ({cleanCode})";
+        if (cleanCode.StartsWith("MT69")) return $"联发科天玑 9000系列 ({cleanCode})";
+        if (cleanCode.StartsWith("MT68")) return $"联发科天玑系列 ({cleanCode})";
+        if (cleanCode.StartsWith("KIRIN") || cleanCode.StartsWith("HI")) return $"海思麒麟芯片 ({cleanCode})";
+
+        return cleanCode;
     }
     
     private async Task<string> GetWindowsVersionAsync()
@@ -14085,6155 +8086,6 @@ public partial class MainWindow : Window
         
         return "--";
     }
-    
-    // 传入文件到手机按钮点击事件
-    private async void Button_Click_1(object sender, RoutedEventArgs e)
-    {
-       try
-        {
-            // 获取按钮对象并检查其内容来区分功能
-            if (sender is System.Windows.Controls.Button button)
-            {
-                string action = button.Tag as string ?? "";
-                if (string.IsNullOrEmpty(action))
-                {
-                    if (button.Content is string s) action = s;
-                    else if (button.Content is System.Windows.Controls.TextBlock tb) action = tb.Text;
-                    else if (button.Content is System.Windows.Controls.Panel panel)
-                    {
-                        var childTb = panel.Children.OfType<System.Windows.Controls.TextBlock>().FirstOrDefault();
-                        action = childTb?.Text ?? (button.Content?.ToString() ?? "");
-                    }
-                    else
-                    {
-                        action = button.Content?.ToString() ?? "";
-                    }
-                }
-                
-                if (action == "解包Payload")
-                {
-                    await HandlePayloadUnpack();
-                }
-                else if (action == "传入文件到手机")
-                {
-                    // 传入文件到手机：禁用按钮避免重复点击
-                    button.IsEnabled = false;
-                    bool transferLockAcquired = _systemZoneTransferLock.Wait(0);
-                    try
-                    {
-                        if (!transferLockAcquired)
-                        {
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，请稍后再试";
-                            FileTransferLogTextBox.ScrollToEnd();
-                            return;
-                        }
-
-                        await HandleFileTransfer();
-                    }
-                    finally
-                    {
-                        if (transferLockAcquired)
-                        {
-                            _systemZoneTransferLock.Release();
-                        }
-
-                        button.IsEnabled = true;
-                    }
-                }
-                else if (action == "开始检测设备")
-                {
-                    HandleStartDeviceDetection();
-                }
-                else if (action == "停止检测设备")
-                {
-                    HandleStopDeviceDetection();
-                }
-                else if (action == "读分区表")
-                {
-                    await HandleReadPartitionTable();
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 操作过程中发生异常: {ex.Message}";
-                FileTransferLogTextBox.ScrollToEnd();
-            });
-        }
-    }
-    
-        private sealed class RichTextBoxLogBuffer : IDisposable
-        {
-            private readonly System.Windows.Controls.RichTextBox _richTextBox;
-            private readonly ConcurrentQueue<string> _queue = new ConcurrentQueue<string>();
-            private readonly DispatcherTimer _timer;
-            private readonly int _maxCharacters;
-            private int _approxCharacterCount;
-            private bool _disposed;
-
-            public RichTextBoxLogBuffer(System.Windows.Controls.RichTextBox richTextBox, TimeSpan interval, int maxCharacters)
-            {
-                _richTextBox = richTextBox;
-                _maxCharacters = Math.Max(0, maxCharacters);
-                _timer = new DispatcherTimer(DispatcherPriority.Background, richTextBox.Dispatcher)
-                {
-                    Interval = interval
-                };
-                _timer.Tick += TimerOnTick;
-                _timer.Start();
-            }
-
-            public void Enqueue(string text)
-            {
-                if (_disposed) return;
-                if (string.IsNullOrEmpty(text)) return;
-                _queue.Enqueue(text);
-            }
-
-            private void TimerOnTick(object? sender, EventArgs e)
-            {
-                Flush();
-            }
-
-            public void Flush()
-            {
-                if (_disposed) return;
-                if (_queue.IsEmpty) return;
-
-                if (_richTextBox.Dispatcher.CheckAccess())
-                {
-                    FlushCore();
-                    return;
-                }
-
-                _richTextBox.Dispatcher.Invoke(FlushCore);
-            }
-
-            private void FlushCore()
-            {
-                if (_disposed) return;
-                if (_queue.IsEmpty) return;
-
-                var sb = new StringBuilder();
-                while (_queue.TryDequeue(out var item))
-                {
-                    sb.Append(item);
-                }
-
-                if (sb.Length == 0) return;
-
-                if (_maxCharacters > 0 && _approxCharacterCount + sb.Length > _maxCharacters)
-                {
-                    _richTextBox.Document.Blocks.Clear();
-                    _approxCharacterCount = 0;
-                }
-
-                var text = sb.ToString().Replace("\r\n", "\n");
-                var lines = text.Split('\n');
-                foreach (var line in lines)
-                {
-                    if (string.IsNullOrEmpty(line))
-                    {
-                        continue;
-                    }
-
-                    var paragraph = new Paragraph { Margin = new Thickness(0) };
-                    paragraph.Inlines.Add(new Run(line));
-                    _richTextBox.Document.Blocks.Add(paragraph);
-                    _approxCharacterCount += line.Length;
-                }
-
-                _richTextBox.ScrollToEnd();
-            }
-
-            public void Dispose()
-            {
-                if (_disposed) return;
-                if (_richTextBox.Dispatcher.CheckAccess())
-                {
-                    DisposeCore();
-                    return;
-                }
-
-                _richTextBox.Dispatcher.Invoke(DisposeCore);
-            }
-
-            private void DisposeCore()
-            {
-                if (_disposed) return;
-                _disposed = true;
-                _timer.Stop();
-                _timer.Tick -= TimerOnTick;
-                FlushCore();
-            }
-        }
-
-        private const string AdbServerHost = "127.0.0.1";
-        private const int AdbServerPort = 5037;
-        private const int AdbSyncChunkSize = 64 * 1024;
-        private static readonly Regex AnsiEscapeSequenceRegex = new Regex(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
-        private static readonly Regex AdbTransferPercentRegex = new Regex(@"(?<!\d)(?<percent>\d{1,3})%", RegexOptions.Compiled);
-
-        private static string SanitizeProcessLine(string line)
-        {
-            if (string.IsNullOrEmpty(line)) return string.Empty;
-            var cleaned = AnsiEscapeSequenceRegex.Replace(line, string.Empty);
-            cleaned = cleaned.Replace("\0", string.Empty);
-            return cleaned;
-        }
-
-        private static void ConfigureHiddenRedirectedProcess(ProcessStartInfo startInfo)
-        {
-            startInfo.UseShellExecute = false;
-            startInfo.RedirectStandardOutput = true;
-            startInfo.RedirectStandardError = true;
-            startInfo.CreateNoWindow = true;
-            startInfo.WindowStyle = ProcessWindowStyle.Hidden;
-            if (startInfo.StandardOutputEncoding == null || startInfo.StandardErrorEncoding == null)
-            {
-                Encoding encoding;
-                try
-                {
-                    var oemCodePage = CultureInfo.CurrentCulture.TextInfo.OEMCodePage;
-                    encoding = Encoding.GetEncoding(oemCodePage);
-                }
-                catch
-                {
-                    encoding = Encoding.UTF8;
-                }
-
-                startInfo.StandardOutputEncoding ??= encoding;
-                startInfo.StandardErrorEncoding ??= encoding;
-            }
-        }
-
-        private void SetSystemZoneTransferProgress(double progress)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                if (SystemZoneProgressBar == null)
-                {
-                    return;
-                }
-
-                SystemZoneProgressBar.Visibility = Visibility.Visible;
-                SystemZoneProgressBar.Minimum = 0;
-                SystemZoneProgressBar.Maximum = 100;
-                double normalizedProgress = Math.Max(0, Math.Min(100, progress));
-                SystemZoneProgressBar.Value = normalizedProgress;
-                UpdateSystemZoneProgressBarTag();
-            });
-        }
-
-        private void UpdateSystemZoneProgressBarTag(string? indexText = null, string? speedText = null)
-        {
-            if (SystemZoneProgressBar == null)
-            {
-                return;
-            }
-
-            string currentIndex = "0/0";
-            string currentSpeed = "0.00 B/s";
-            string? currentTag = SystemZoneProgressBar.Tag?.ToString();
-            if (!string.IsNullOrWhiteSpace(currentTag))
-            {
-                string[] parts = currentTag.Split(new[] { "    " }, StringSplitOptions.None);
-                if (parts.Length > 0 && !string.IsNullOrWhiteSpace(parts[0]))
-                {
-                    currentIndex = parts[0];
-                }
-
-                if (parts.Length > 1 && !string.IsNullOrWhiteSpace(parts[1]))
-                {
-                    currentSpeed = parts[1];
-                }
-            }
-
-            SystemZoneProgressBar.Tag = $"{indexText ?? currentIndex}    {speedText ?? currentSpeed}";
-        }
-
-        private void SetSystemZoneTransferFileProgress(int currentFileIndex, int totalFileCount)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                if (SystemZoneProgressBar == null)
-                {
-                    return;
-                }
-
-                int safeTotal = Math.Max(0, totalFileCount);
-                int safeCurrent = safeTotal == 0 ? 0 : Math.Max(0, Math.Min(currentFileIndex, safeTotal));
-                UpdateSystemZoneProgressBarTag(indexText: $"{safeCurrent}/{safeTotal}");
-            });
-        }
-
-        private void SetSystemZoneTransferSpeed(double bytesPerSecond)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                if (SystemZoneProgressBar == null)
-                {
-                    return;
-                }
-
-                double safeBytesPerSecond = Math.Max(0, bytesPerSecond);
-                UpdateSystemZoneProgressBarTag(speedText: FormatTransferSpeed(safeBytesPerSecond));
-            });
-        }
-
-        private static string FormatTransferSpeed(double bytesPerSecond)
-        {
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
-            double value = bytesPerSecond;
-            int unitIndex = 0;
-
-            while (value >= 1024 && unitIndex < units.Length - 1)
-            {
-                value /= 1024.0;
-                unitIndex++;
-            }
-
-            return $"{value:F2} {units[unitIndex]}/s";
-        }
-
-        private static double CalculateTransferSpeed(Stopwatch stopwatch, long transferredBytes, ref double? lastSmoothedSpeed)
-        {
-            double elapsedSeconds = Math.Max(stopwatch.Elapsed.TotalSeconds, 1e-6);
-            double currentSpeed = transferredBytes > 0 ? transferredBytes / elapsedSeconds : 0;
-
-            if (lastSmoothedSpeed.HasValue)
-            {
-                currentSpeed = lastSmoothedSpeed.Value * 0.7 + currentSpeed * 0.3;
-            }
-
-            lastSmoothedSpeed = currentSpeed;
-            return currentSpeed;
-        }
-
-        private string BuildAdbArguments(string command)
-        {
-            string selectedSerial = GetSelectedDeviceSerial();
-            return string.IsNullOrWhiteSpace(selectedSerial) ? command : $"-s {selectedSerial} {command}";
-        }
-
-        private static string ExtractTransferSummary(string stdOut, string stdErr)
-        {
-            var merged = $"{stdOut}\n{stdErr}";
-            var lines = merged
-                .Replace("\r", "\n")
-                .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => SanitizeProcessLine(line).Trim())
-                .Where(line => !string.IsNullOrWhiteSpace(line))
-                .Where(line => !AdbTransferPercentRegex.IsMatch(line))
-                .ToList();
-
-            return lines.Count == 0 ? string.Empty : lines[^1];
-        }
-
-        private static double CalculateTransferPercent(long transferredBytes, long totalBytes)
-        {
-            if (totalBytes <= 0)
-            {
-                return 0;
-            }
-
-            long safeTransferredBytes = Math.Max(0, Math.Min(totalBytes, transferredBytes));
-            return (safeTransferredBytes * 100d) / totalBytes;
-        }
-
-        private static long GetExistingFileSize(string filePath)
-        {
-            try
-            {
-                return File.Exists(filePath) ? new FileInfo(filePath).Length : 0L;
-            }
-            catch
-            {
-                return 0L;
-            }
-        }
-
-        private static bool IsAdbDeviceDisconnectedError(string? message)
-        {
-            if (string.IsNullOrWhiteSpace(message))
-            {
-                return false;
-            }
-
-            string normalized = message.Trim().ToLowerInvariant();
-            return normalized.Contains("no devices/emulators found")
-                || normalized.Contains("no devices found")
-                || normalized.Contains("device offline")
-                || normalized.Contains("device not found")
-                || normalized.Contains("more than one device/emulator")
-                || normalized.Contains("unauthorized")
-                || normalized.Contains("cannot connect to daemon")
-                || normalized.Contains("failed to get feature set")
-                || normalized.Contains("closed");
-        }
-
-        private static byte[] GetLittleEndianBytes(int value)
-        {
-            byte[] bytes = BitConverter.GetBytes(value);
-            if (!BitConverter.IsLittleEndian)
-            {
-                Array.Reverse(bytes);
-            }
-
-            return bytes;
-        }
-
-        private static async Task<byte[]> ReceiveExactAsync(
-            Stream stream,
-            int length,
-            CancellationToken cancellationToken = default)
-        {
-            byte[] buffer = new byte[length];
-            int offset = 0;
-
-            while (offset < length)
-            {
-                int read = await stream.ReadAsync(buffer, offset, length - offset, cancellationToken);
-                if (read <= 0)
-                {
-                    throw new IOException("ADB 连接被意外关闭。");
-                }
-
-                offset += read;
-            }
-
-            return buffer;
-        }
-
-        private static async Task SendAdbRequestAsync(
-            Stream stream,
-            string payload,
-            CancellationToken cancellationToken = default)
-        {
-            byte[] data = Encoding.UTF8.GetBytes(payload);
-            byte[] header = Encoding.ASCII.GetBytes(data.Length.ToString("x4"));
-            await stream.WriteAsync(header, 0, header.Length, cancellationToken);
-            await stream.WriteAsync(data, 0, data.Length, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-        }
-
-        private static async Task ReadAdbStatusAsync(
-            Stream stream,
-            CancellationToken cancellationToken = default)
-        {
-            string status = Encoding.ASCII.GetString(await ReceiveExactAsync(stream, 4, cancellationToken));
-            if (status == "OKAY")
-            {
-                return;
-            }
-
-            if (status == "FAIL")
-            {
-                string hexLength = Encoding.ASCII.GetString(await ReceiveExactAsync(stream, 4, cancellationToken));
-                int messageLength = int.Parse(hexLength, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-                string message = Encoding.UTF8.GetString(await ReceiveExactAsync(stream, messageLength, cancellationToken));
-                throw new InvalidOperationException($"ADB FAIL: {message}");
-            }
-
-            throw new InvalidOperationException($"未知 ADB 状态: {status}");
-        }
-
-        private static async Task SendSyncPacketAsync(
-            Stream stream,
-            string ident,
-            int length,
-            CancellationToken cancellationToken = default)
-        {
-            if (ident.Length != 4)
-            {
-                throw new ArgumentException("SYNC ident 必须是 4 个字符。", nameof(ident));
-            }
-
-            byte[] identBytes = Encoding.ASCII.GetBytes(ident);
-            byte[] lengthBytes = GetLittleEndianBytes(length);
-            await stream.WriteAsync(identBytes, 0, identBytes.Length, cancellationToken);
-            await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, cancellationToken);
-        }
-
-        private static async Task ReadSyncStatusAsync(
-            Stream stream,
-            CancellationToken cancellationToken = default)
-        {
-            string ident = Encoding.ASCII.GetString(await ReceiveExactAsync(stream, 4, cancellationToken));
-            int length = BitConverter.ToInt32(await ReceiveExactAsync(stream, 4, cancellationToken), 0);
-
-            if (ident == "OKAY")
-            {
-                return;
-            }
-
-            if (ident == "FAIL")
-            {
-                string message = Encoding.UTF8.GetString(await ReceiveExactAsync(stream, length, cancellationToken));
-                throw new InvalidOperationException($"SYNC FAIL: {message}");
-            }
-
-            throw new InvalidOperationException($"未知 SYNC 响应: ident={ident}, length={length}");
-        }
-
-        private async Task EnsureAdbServerRunningAsync(CancellationToken cancellationToken = default)
-        {
-            string adbPath = GetToolPath("adb.exe");
-            if (string.IsNullOrWhiteSpace(adbPath))
-            {
-                throw new FileNotFoundException("未找到 adb.exe");
-            }
-
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = adbPath,
-                Arguments = "start-server",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
-            try
-            {
-                await process.WaitForExitAsync(cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                }
-                throw;
-            }
-        }
-
-        private async Task ExecuteAdbSyncPushAsync(
-            string localFilePath,
-            string remotePath,
-            Action<long, long>? progressCallback = null,
-            int mode = 0x1A4,
-            CancellationToken cancellationToken = default)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!File.Exists(localFilePath))
-            {
-                throw new FileNotFoundException($"找不到本地文件: {localFilePath}");
-            }
-
-            await EnsureAdbServerRunningAsync(cancellationToken);
-
-            string selectedSerial = GetSelectedDeviceSerial();
-            long totalSize = new FileInfo(localFilePath).Length;
-            int mtime = (int)new FileInfo(localFilePath).LastWriteTimeUtc.Subtract(new DateTime(1970, 1, 1)).TotalSeconds;
-            string sendTarget = $"{remotePath},{mode}";
-
-            using var client = new TcpClient();
-            await client.ConnectAsync(AdbServerHost, AdbServerPort, cancellationToken);
-            client.ReceiveTimeout = 30000;
-            client.SendTimeout = 30000;
-
-            using NetworkStream stream = client.GetStream();
-
-            await SendAdbRequestAsync(stream, string.IsNullOrWhiteSpace(selectedSerial) ? "host:transport-any" : $"host:transport:{selectedSerial}", cancellationToken);
-            await ReadAdbStatusAsync(stream, cancellationToken);
-
-            await SendAdbRequestAsync(stream, "sync:", cancellationToken);
-            await ReadAdbStatusAsync(stream, cancellationToken);
-
-            byte[] sendTargetBytes = Encoding.UTF8.GetBytes(sendTarget);
-            await SendSyncPacketAsync(stream, "SEND", sendTargetBytes.Length, cancellationToken);
-            await stream.WriteAsync(sendTargetBytes, 0, sendTargetBytes.Length, cancellationToken);
-
-            long sent = 0;
-            byte[] buffer = new byte[AdbSyncChunkSize];
-
-            using FileStream fileStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            while (true)
-            {
-                int read = await fileStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                if (read <= 0)
-                {
-                    break;
-                }
-
-                await SendSyncPacketAsync(stream, "DATA", read, cancellationToken);
-                await stream.WriteAsync(buffer, 0, read, cancellationToken);
-                sent += read;
-                progressCallback?.Invoke(sent, totalSize);
-            }
-
-            await SendSyncPacketAsync(stream, "DONE", mtime, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-            await ReadSyncStatusAsync(stream, cancellationToken);
-            progressCallback?.Invoke(totalSize, totalSize);
-        }
-
-        private async Task ExecuteAdbSyncPullAsync(
-            string remotePath,
-            string localFilePath,
-            Action<long, long>? progressCallback = null,
-            long? expectedTotalSize = null,
-            CancellationToken cancellationToken = default)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await EnsureAdbServerRunningAsync(cancellationToken);
-
-            long totalSize = await TryGetRemoteFileSizeAsync(remotePath) ?? Math.Max(0L, expectedTotalSize ?? 0L);
-            string selectedSerial = GetSelectedDeviceSerial();
-
-            string? localDirectory = Path.GetDirectoryName(localFilePath);
-            if (!string.IsNullOrWhiteSpace(localDirectory))
-            {
-                Directory.CreateDirectory(localDirectory);
-            }
-
-            using var client = new TcpClient();
-            await client.ConnectAsync(AdbServerHost, AdbServerPort, cancellationToken);
-            client.ReceiveTimeout = 30000;
-            client.SendTimeout = 30000;
-
-            using NetworkStream stream = client.GetStream();
-
-            await SendAdbRequestAsync(stream, string.IsNullOrWhiteSpace(selectedSerial) ? "host:transport-any" : $"host:transport:{selectedSerial}", cancellationToken);
-            await ReadAdbStatusAsync(stream, cancellationToken);
-
-            await SendAdbRequestAsync(stream, "sync:", cancellationToken);
-            await ReadAdbStatusAsync(stream, cancellationToken);
-
-            byte[] remotePathBytes = Encoding.UTF8.GetBytes(remotePath);
-            await SendSyncPacketAsync(stream, "RECV", remotePathBytes.Length, cancellationToken);
-            await stream.WriteAsync(remotePathBytes, 0, remotePathBytes.Length, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-
-            long received = 0;
-
-            try
-            {
-                using FileStream fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
-
-                while (true)
-                {
-                    string ident = Encoding.ASCII.GetString(await ReceiveExactAsync(stream, 4, cancellationToken));
-                    int length = BitConverter.ToInt32(await ReceiveExactAsync(stream, 4, cancellationToken), 0);
-
-                    if (ident == "DATA")
-                    {
-                        byte[] data = await ReceiveExactAsync(stream, length, cancellationToken);
-                        await fileStream.WriteAsync(data, 0, data.Length, cancellationToken);
-                        received += data.Length;
-                        progressCallback?.Invoke(received, totalSize);
-                        continue;
-                    }
-
-                    if (ident == "DONE")
-                    {
-                        break;
-                    }
-
-                    if (ident == "FAIL")
-                    {
-                        string message = Encoding.UTF8.GetString(await ReceiveExactAsync(stream, length, cancellationToken));
-                        throw new InvalidOperationException($"SYNC FAIL: {message}");
-                    }
-
-                    throw new InvalidOperationException($"未知 SYNC 响应: ident={ident}, length={length}");
-                }
-
-                await fileStream.FlushAsync(cancellationToken);
-            }
-            catch
-            {
-                try
-                {
-                    if (File.Exists(localFilePath))
-                    {
-                        File.Delete(localFilePath);
-                    }
-                }
-                catch
-                {
-                }
-
-                throw;
-            }
-
-            progressCallback?.Invoke(Math.Max(received, totalSize), Math.Max(totalSize, received));
-        }
-
-        // ADB 的 SYNC 服务始终以 shell 身份运行，不能直接读写 /data 等 Root 路径。
-        // Root 模式下先使用 shell 可访问的临时文件完成 SYNC，再由 su 完成最终复制。
-        private const string SystemZoneStagingDirectory = "/data/local/tmp";
-
-        private static string CreateSystemZoneStagingPath()
-        {
-            return $"{SystemZoneStagingDirectory}/violet-systemzone-{Guid.NewGuid():N}";
-        }
-
-        private async Task ExecuteSystemZonePushAsync(
-            string localFilePath,
-            string remotePath,
-            Action<long, long>? progressCallback = null,
-            int mode = 0x1A4,
-            CancellationToken cancellationToken = default)
-        {
-            if (!IsSystemZoneRootDirectorySelected())
-            {
-                await ExecuteAdbSyncPushAsync(localFilePath, remotePath, progressCallback, mode, cancellationToken);
-                return;
-            }
-
-            string stagingPath = CreateSystemZoneStagingPath();
-            long totalSize = new FileInfo(localFilePath).Length;
-            try
-            {
-                await ExecuteAdbSyncPushAsync(
-                    localFilePath,
-                    stagingPath,
-                    (sentBytes, currentFileTotalBytes) =>
-                    {
-                        long safeTotalBytes = Math.Max(1, currentFileTotalBytes);
-                        // 保留最后一小段进度给 Root 复制，避免文件尚未落到目标路径就显示完成。
-                        long stagedBytes = Math.Min(safeTotalBytes, sentBytes) * 95 / 100;
-                        progressCallback?.Invoke(stagedBytes, safeTotalBytes);
-                    },
-                    mode,
-                    cancellationToken);
-
-                string copyCommand =
-                    $"cp -f -- {QuoteAndroidShellArgument(stagingPath)} {QuoteAndroidShellArgument(remotePath)}";
-                await ExecuteSystemZoneRootCommandAsync(copyCommand);
-                progressCallback?.Invoke(totalSize, totalSize);
-            }
-            finally
-            {
-                await DeleteSystemZoneStagingFileAsync(stagingPath);
-            }
-        }
-
-        private async Task ExecuteSystemZonePullAsync(
-            string remotePath,
-            string localFilePath,
-            Action<long, long>? progressCallback = null,
-            long? expectedTotalSize = null,
-            CancellationToken cancellationToken = default)
-        {
-            if (!IsSystemZoneRootDirectorySelected())
-            {
-                await ExecuteAdbSyncPullAsync(
-                    remotePath,
-                    localFilePath,
-                    progressCallback,
-                    expectedTotalSize,
-                    cancellationToken);
-                return;
-            }
-
-            string stagingPath = CreateSystemZoneStagingPath();
-            try
-            {
-                // 使 staging 文件可被 shell 身份的 ADB SYNC 服务读取。
-                string copyCommand =
-                    $"cp -f -- {QuoteAndroidShellArgument(remotePath)} {QuoteAndroidShellArgument(stagingPath)} && " +
-                    $"chmod 0644 -- {QuoteAndroidShellArgument(stagingPath)}";
-                await ExecuteSystemZoneRootCommandAsync(copyCommand);
-                await ExecuteAdbSyncPullAsync(
-                    stagingPath,
-                    localFilePath,
-                    progressCallback,
-                    expectedTotalSize,
-                    cancellationToken);
-            }
-            finally
-            {
-                await DeleteSystemZoneStagingFileAsync(stagingPath);
-            }
-        }
-
-        private async Task ExecuteSystemZoneRootCommandAsync(string rootCommand)
-        {
-            var result = await RunSystemZoneAdbCommandAsync(
-                $"shell su -c {QuoteAndroidShellArgument(rootCommand)}");
-            if (result.ExitCode == 0 && string.IsNullOrWhiteSpace(result.StdErr))
-            {
-                return;
-            }
-
-            string message = string.IsNullOrWhiteSpace(result.StdErr)
-                ? $"ADB 退出码 {result.ExitCode}"
-                : result.StdErr.Trim();
-            throw new InvalidOperationException(message);
-        }
-
-        // 文件管理操作必须与当前加载位置使用相同的权限上下文。
-        // 内部存储保持 shell；根目录模式统一通过 su 执行。
-        private Task<(int ExitCode, string StdOut, string StdErr)> RunSystemZoneFileCommandAsync(
-            string shellCommand)
-        {
-            string adbCommand = IsSystemZoneRootDirectorySelected()
-                ? $"shell su -c {QuoteAndroidShellArgument(shellCommand)}"
-                : $"shell {shellCommand}";
-            return RunSystemZoneAdbCommandAsync(adbCommand);
-        }
-
-        private async Task DeleteSystemZoneStagingFileAsync(string stagingPath)
-        {
-            try
-            {
-                await RunSystemZoneAdbCommandAsync(
-                    $"shell rm -f -- {QuoteAndroidShellArgument(stagingPath)}");
-            }
-            catch
-            {
-                // 临时文件清理失败不应掩盖原始传输错误；临时文件名是每次随机生成的。
-            }
-        }
-
-        private static long? ParseRemoteFileSize(string output)
-        {
-            if (string.IsNullOrWhiteSpace(output))
-            {
-                return null;
-            }
-
-            var lines = output
-                .Replace("\r", "\n")
-                .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => SanitizeProcessLine(line).Trim());
-
-            foreach (string line in lines)
-            {
-                if (long.TryParse(line, out long directSize))
-                {
-                    return directSize;
-                }
-
-                Match lsMatch = Regex.Match(line, @"^\S+\s+\d+\s+\S+\s+\S+\s+(?<size>\d+)\s+");
-                if (lsMatch.Success && long.TryParse(lsMatch.Groups["size"].Value, out long listedSize))
-                {
-                    return listedSize;
-                }
-            }
-
-            return null;
-        }
-
-        private async Task<long?> TryGetRemoteFileSizeAsync(string remotePath)
-        {
-            if (string.IsNullOrWhiteSpace(remotePath))
-            {
-                return null;
-            }
-
-            string escapedRemotePath = remotePath.Replace("\"", "\\\"");
-            string[] commands =
-            {
-                $"shell stat -c %s \"{escapedRemotePath}\"",
-                $"shell toybox stat -c %s \"{escapedRemotePath}\"",
-                $"shell ls -ln \"{escapedRemotePath}\""
-            };
-
-            foreach (string command in commands)
-            {
-                long? size = ParseRemoteFileSize(await ExecuteAdbCommandWithOutput(command));
-                if (size.HasValue)
-                {
-                    return size;
-                }
-            }
-
-            return null;
-        }
-
-        private async Task<long> ResolvePartitionTransferSizeAsync(string remotePath, string? partitionSizeText)
-        {
-            long? remoteFileSize = await TryGetRemoteFileSizeAsync(remotePath);
-            if (remoteFileSize.HasValue && remoteFileSize.Value > 0)
-            {
-                return remoteFileSize.Value;
-            }
-
-            if (!string.IsNullOrWhiteSpace(partitionSizeText) && partitionSizeText != "--")
-            {
-                long parsedSize = ParsePartitionSizeToBytes(partitionSizeText);
-                if (parsedSize > 0)
-                {
-                    return parsedSize;
-                }
-            }
-
-            return 1;
-        }
-
-        private static async Task ReadTransferStreamAsync(
-            StreamReader reader,
-            StringBuilder outputBuilder,
-            Action<int>? reportPercent)
-        {
-            var buffer = new char[256];
-            var rollingWindow = new StringBuilder();
-            int lastReportedPercent = -1;
-
-            while (true)
-            {
-                int read = await reader.ReadAsync(buffer, 0, buffer.Length);
-                if (read <= 0)
-                {
-                    break;
-                }
-
-                string chunk = new string(buffer, 0, read);
-                outputBuilder.Append(chunk);
-
-                if (reportPercent == null)
-                {
-                    continue;
-                }
-
-                rollingWindow.Append(chunk);
-                if (rollingWindow.Length > 512)
-                {
-                    rollingWindow.Remove(0, rollingWindow.Length - 512);
-                }
-
-                int latestPercent = lastReportedPercent;
-                foreach (Match match in AdbTransferPercentRegex.Matches(rollingWindow.ToString()))
-                {
-                    if (int.TryParse(match.Groups["percent"].Value, out int parsedPercent))
-                    {
-                        latestPercent = Math.Max(latestPercent, Math.Min(100, parsedPercent));
-                    }
-                }
-
-                if (latestPercent > lastReportedPercent)
-                {
-                    lastReportedPercent = latestPercent;
-                    reportPercent(latestPercent);
-                }
-            }
-        }
-
-        private async Task<(int ExitCode, string StdOut, string StdErr)> RunAdbTransferWithProgressAsync(
-            ProcessStartInfo startInfo,
-            Action<int>? reportPercent = null,
-            Func<Task<int?>>? pollPercent = null)
-        {
-            ConfigureHiddenRedirectedProcess(startInfo);
-
-            var stdOutBuilder = new StringBuilder();
-            var stdErrBuilder = new StringBuilder();
-            object progressLock = new object();
-            int lastPercent = -1;
-
-            void SafeReportPercent(int percent)
-            {
-                lock (progressLock)
-                {
-                    if (percent <= lastPercent)
-                    {
-                        return;
-                    }
-
-                    lastPercent = percent;
-                }
-
-                reportPercent?.Invoke(percent);
-            }
-
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
-
-            Task stdOutTask = ReadTransferStreamAsync(process.StandardOutput, stdOutBuilder, SafeReportPercent);
-            Task stdErrTask = ReadTransferStreamAsync(process.StandardError, stdErrBuilder, SafeReportPercent);
-            Task pollingTask = pollPercent == null
-                ? Task.CompletedTask
-                : Task.Run(async () =>
-                {
-                    while (!process.HasExited)
-                    {
-                        try
-                        {
-                            int? polledPercent = await pollPercent();
-                            if (polledPercent.HasValue)
-                            {
-                                SafeReportPercent(polledPercent.Value);
-                            }
-                        }
-                        catch
-                        {
-                        }
-
-                        if (process.HasExited)
-                        {
-                            break;
-                        }
-
-                        await Task.Delay(250);
-                    }
-                });
-            Task waitForExitTask = process.WaitForExitAsync();
-
-            await Task.WhenAll(stdOutTask, stdErrTask, waitForExitTask, pollingTask);
-
-            if (process.ExitCode == 0)
-            {
-                reportPercent?.Invoke(100);
-            }
-
-            return (process.ExitCode, stdOutBuilder.ToString(), stdErrBuilder.ToString());
-        }
-
-        private async Task<(int ExitCode, string StdOut, string StdErr)> RunProcessWithLiveLogAsync(
-            ProcessStartInfo startInfo,
-            RichTextBoxLogBuffer logBuffer,
-            TimeSpan? timeout = null,
-            string? stillRunningMessage = null,
-            TimeSpan? stillRunningInterval = null)
-        {
-            ConfigureHiddenRedirectedProcess(startInfo);
-
-            var stdOutBuilder = new StringBuilder();
-            var stdErrBuilder = new StringBuilder();
-
-            using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-
-            logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] 启动命令: {startInfo.FileName} {startInfo.Arguments}\n");
-            if (!string.IsNullOrWhiteSpace(startInfo.WorkingDirectory))
-            {
-                logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] 工作目录: {startInfo.WorkingDirectory}\n");
-            }
-
-            try
-            {
-                process.Start();
-            }
-            catch (Exception ex)
-            {
-                var message = ex.InnerException?.Message ?? ex.Message;
-                logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] 启动失败: {message}\n");
-                logBuffer.Flush();
-                return (-1, string.Empty, $"启动失败: {message}");
-            }
-            var stdoutTask = PumpReaderAsync(process.StandardOutput, false, stdOutBuilder, logBuffer);
-            var stderrTask = PumpReaderAsync(process.StandardError, true, stdErrBuilder, logBuffer);
-
-            var exitTask = process.WaitForExitAsync();
-
-            Task? tickerTask = null;
-            using var tickerCts = new CancellationTokenSource();
-            if (!string.IsNullOrWhiteSpace(stillRunningMessage))
-            {
-                var interval = stillRunningInterval ?? TimeSpan.FromSeconds(5);
-                tickerTask = Task.Run(async () =>
-                {
-                    while (!tickerCts.IsCancellationRequested)
-                    {
-                        try
-                        {
-                            await Task.Delay(interval, tickerCts.Token).ConfigureAwait(false);
-                        }
-                        catch
-                        {
-                            break;
-                        }
-
-                        if (!process.HasExited)
-                        {
-                            logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] {stillRunningMessage}\n");
-                        }
-                    }
-                }, tickerCts.Token);
-            }
-
-            Task completed;
-            if (timeout.HasValue && timeout.Value > TimeSpan.Zero)
-            {
-                completed = await Task.WhenAny(exitTask, Task.Delay(timeout.Value)).ConfigureAwait(false);
-                if (completed != exitTask)
-                {
-                    try
-                    {
-                        if (!process.HasExited)
-                        {
-                            process.Kill(entireProcessTree: true);
-                        }
-                    }
-                    catch
-                    {
-                    }
-
-                    tickerCts.Cancel();
-                    if (tickerTask != null)
-                    {
-                        try { await tickerTask.ConfigureAwait(false); } catch { }
-                    }
-
-                    try { await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false); } catch { }
-                    logBuffer.Flush();
-                    return (-1, stdOutBuilder.ToString(), $"运行超时({timeout.Value.TotalSeconds:0}s)：{startInfo.FileName} {startInfo.Arguments}");
-                }
-            }
-            else
-            {
-                await exitTask.ConfigureAwait(false);
-            }
-
-            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-            tickerCts.Cancel();
-            if (tickerTask != null)
-            {
-                try { await tickerTask.ConfigureAwait(false); } catch { }
-            }
-
-            logBuffer.Flush();
-            return (process.ExitCode, stdOutBuilder.ToString(), stdErrBuilder.ToString());
-        }
-
-        private static async Task PumpReaderAsync(
-            StreamReader reader,
-            bool isError,
-            StringBuilder builder,
-            RichTextBoxLogBuffer logBuffer)
-        {
-            var buffer = new char[1024];
-            var carry = string.Empty;
-
-            while (true)
-            {
-                var read = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
-                if (read <= 0) break;
-
-                var chunk = new string(buffer, 0, read);
-                var combined = carry.Length > 0 ? carry + chunk : chunk;
-
-                var sanitized = SanitizeProcessLine(combined);
-                sanitized = sanitized.Replace("\r\n", "\n").Replace('\r', '\n');
-
-                if (combined.IndexOf('\u001b') >= 0 || carry.IndexOf('\u001b') >= 0)
-                {
-                    var lastEsc = combined.LastIndexOf('\u001b');
-                    if (lastEsc >= 0 && combined.Length - lastEsc < 32)
-                    {
-                        carry = combined.Substring(lastEsc);
-                    }
-                    else
-                    {
-                        carry = string.Empty;
-                    }
-                }
-                else
-                {
-                    carry = string.Empty;
-                }
-
-                builder.Append(sanitized);
-                if (isError)
-                {
-                    logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] 错误: {sanitized}");
-                    if (!sanitized.EndsWith("\n", StringComparison.Ordinal))
-                    {
-                        logBuffer.Enqueue("\n");
-                    }
-                }
-                else
-                {
-                    logBuffer.Enqueue($"[{DateTime.Now:HH:mm:ss}] {sanitized}");
-                    if (!sanitized.EndsWith("\n", StringComparison.Ordinal))
-                    {
-                        logBuffer.Enqueue("\n");
-                    }
-                }
-            }
-        }
-
-
-        // 文件拖放到ListBox时的DragOver事件处理
-        private void FileListTextBox_DragOver(object sender, System.Windows.DragEventArgs e)
-        {
-            // 检查拖放的数据是否包含文件
-            if (e.Data.GetDataPresent(System.Windows.DataFormats.FileDrop))
-            {
-                e.Effects = System.Windows.DragDropEffects.Copy;
-            }
-            else
-            {
-                e.Effects = System.Windows.DragDropEffects.None;
-            }
-            e.Handled = true;
-        }
-
-        // 文件拖放到ListBox时的Drop事件处理
-        private async void FileListTextBox_Drop(object sender, System.Windows.DragEventArgs e)
-        {
-            bool transferLockAcquired = false;
-            try
-            {
-                if (!e.Data.GetDataPresent(System.Windows.DataFormats.FileDrop))
-                {
-                    return;
-                }
-
-                string[] droppedPaths = (string[])e.Data.GetData(System.Windows.DataFormats.FileDrop);
-                if (droppedPaths == null || droppedPaths.Length == 0)
-                {
-                    return;
-                }
-
-                transferLockAcquired = _systemZoneTransferLock.Wait(0);
-                if (!transferLockAcquired)
-                {
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，本次拖放未执行";
-                    FileTransferLogTextBox.ScrollToEnd();
-                    return;
-                }
-
-                var pushFiles = new List<(string LocalPath, string RemotePath, long Size)>();
-                var remoteDirectories = new HashSet<string>(StringComparer.Ordinal);
-                int preparationFailed = 0;
-
-                foreach (string droppedPath in droppedPaths)
-                {
-                    try
-                    {
-                        if (File.Exists(droppedPath))
-                        {
-                            string remotePath = CombineAndroidPath(lastLoadedDirectory, Path.GetFileName(droppedPath));
-                            pushFiles.Add((droppedPath, remotePath, Math.Max(0, GetExistingFileSize(droppedPath))));
-                        }
-                        else if (Directory.Exists(droppedPath))
-                        {
-                            string directoryName = Path.GetFileName(droppedPath.TrimEnd(
-                                Path.DirectorySeparatorChar,
-                                Path.AltDirectorySeparatorChar));
-                            string remoteRoot = CombineAndroidPath(lastLoadedDirectory, directoryName);
-                            AddLocalDirectoryToSystemZonePushPlan(
-                                droppedPath,
-                                remoteRoot,
-                                pushFiles,
-                                remoteDirectories);
-                        }
-                        else
-                        {
-                            throw new FileNotFoundException($"找不到本地文件或文件夹: {droppedPath}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        preparationFailed++;
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 无法读取拖放项目: {droppedPath}";
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 错误: {ex.Message}";
-                        FileTransferLogTextBox.ScrollToEnd();
-                    }
-                }
-
-                int totalFiles = pushFiles.Count;
-                int progressTotal = Math.Max(1, totalFiles);
-                int success = 0;
-                int failed = 0;
-                long totalBytes = pushFiles.Sum(item => item.Size);
-                if (totalBytes <= 0)
-                {
-                    totalBytes = progressTotal;
-                }
-
-                long transferredCompletedBytes = 0;
-                SetSystemZoneTransferFileProgress(0, progressTotal);
-                SetSystemZoneTransferProgress(0);
-                SetSystemZoneTransferSpeed(0);
-
-                FileTransferLogTextBox.Text +=
-                    $"\n[{DateTime.Now:HH:mm:ss}] 检测到拖放项目 {droppedPaths.Length} 个，包含文件 {totalFiles} 个、目录 {remoteDirectories.Count} 个";
-                FileTransferLogTextBox.ScrollToEnd();
-
-                try
-                {
-                    await CreateSystemZoneRemoteDirectoriesAsync(remoteDirectories);
-                }
-                catch (Exception ex)
-                {
-                    preparationFailed++;
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 创建设备目录结构失败: {ex.Message}";
-                    FileTransferLogTextBox.ScrollToEnd();
-                }
-
-                for (int i = 0; i < totalFiles; i++)
-                {
-                    var pushFile = pushFiles[i];
-                    long completedBytesBeforeCurrent = transferredCompletedBytes;
-                    Stopwatch transferStopwatch = Stopwatch.StartNew();
-                    double? lastSmoothedSpeed = null;
-
-                    SetSystemZoneTransferFileProgress(i + 1, progressTotal);
-                    SetSystemZoneTransferSpeed(0);
-                    FileTransferLogTextBox.Text +=
-                        $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{totalFiles}] 开始传输: {Path.GetFileName(pushFile.LocalPath)}";
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 源: {pushFile.LocalPath}";
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 目标: {pushFile.RemotePath}";
-                    FileTransferLogTextBox.ScrollToEnd();
-
-                    try
-                    {
-                        await ExecuteSystemZonePushAsync(
-                            pushFile.LocalPath,
-                            pushFile.RemotePath,
-                            (sentBytes, currentFileTotalBytes) =>
-                            {
-                                long safeFileTotalBytes = Math.Max(1, currentFileTotalBytes);
-                                long transferredBytes = completedBytesBeforeCurrent + Math.Min(safeFileTotalBytes, sentBytes);
-                                SetSystemZoneTransferProgress(CalculateTransferPercent(transferredBytes, totalBytes));
-                                double currentSpeed = CalculateTransferSpeed(transferStopwatch, sentBytes, ref lastSmoothedSpeed);
-                                SetSystemZoneTransferSpeed(currentSpeed);
-                            });
-
-                        success++;
-                        transferredCompletedBytes += pushFile.Size;
-                        SetSystemZoneTransferProgress(CalculateTransferPercent(transferredCompletedBytes, totalBytes));
-                        FileTransferLogTextBox.Text +=
-                            $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{totalFiles}] 传输成功: {Path.GetFileName(pushFile.LocalPath)}";
-                    }
-                    catch (Exception ex)
-                    {
-                        failed++;
-                        SetSystemZoneTransferProgress(Math.Min(
-                            99,
-                            CalculateTransferPercent(transferredCompletedBytes, totalBytes)));
-                        FileTransferLogTextBox.Text +=
-                            $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{totalFiles}] 传输失败: {Path.GetFileName(pushFile.LocalPath)}";
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 错误: {ex.Message}";
-                    }
-
-                    FileTransferLogTextBox.ScrollToEnd();
-                }
-
-                bool allSucceeded = failed == 0 && preparationFailed == 0;
-                SetSystemZoneTransferFileProgress(progressTotal, progressTotal);
-                SetSystemZoneTransferProgress(
-                    allSucceeded
-                        ? 100
-                        : Math.Min(99, CalculateTransferPercent(transferredCompletedBytes, totalBytes)));
-                SetSystemZoneTransferSpeed(0);
-
-                FileTransferLogTextBox.Text +=
-                    $"\n[{DateTime.Now:HH:mm:ss}] 拖放传输完成：文件成功 {success}，文件失败 {failed}，项目准备失败 {preparationFailed}，目录 {remoteDirectories.Count} 个";
-                FileTransferLogTextBox.ScrollToEnd();
-
-                await LoadFileListFromPath(currentPath);
-            }
-            catch (Exception ex)
-            {
-                SetSystemZoneTransferSpeed(0);
-                Dispatcher.Invoke(() =>
-                {
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 拖放传输过程中发生异常: {ex.Message}";
-                    FileTransferLogTextBox.ScrollToEnd();
-                });
-            }
-            finally
-            {
-                if (transferLockAcquired)
-                {
-                    _systemZoneTransferLock.Release();
-                }
-            }
-        }
-
-        private static string CombineAndroidPath(string directoryPath, string name)
-        {
-            return directoryPath.TrimEnd('/') + "/" + name.Replace('\\', '/');
-        }
-
-        private static void AddLocalDirectoryToSystemZonePushPlan(
-            string localRoot,
-            string remoteRoot,
-            List<(string LocalPath, string RemotePath, long Size)> pushFiles,
-            HashSet<string> remoteDirectories)
-        {
-            var pendingDirectories = new Stack<(string LocalPath, string RemotePath)>();
-            pendingDirectories.Push((localRoot, remoteRoot));
-
-            while (pendingDirectories.Count > 0)
-            {
-                var current = pendingDirectories.Pop();
-                remoteDirectories.Add(current.RemotePath);
-
-                foreach (string entryPath in Directory.EnumerateFileSystemEntries(current.LocalPath))
-                {
-                    FileAttributes attributes = File.GetAttributes(entryPath);
-                    if ((attributes & FileAttributes.Directory) != 0)
-                    {
-                        if ((attributes & FileAttributes.ReparsePoint) != 0)
-                        {
-                            continue;
-                        }
-
-                        string childRemotePath = CombineAndroidPath(current.RemotePath, Path.GetFileName(entryPath));
-                        pendingDirectories.Push((entryPath, childRemotePath));
-                        continue;
-                    }
-
-                    string remoteFilePath = CombineAndroidPath(current.RemotePath, Path.GetFileName(entryPath));
-                    pushFiles.Add((entryPath, remoteFilePath, Math.Max(0, GetExistingFileSize(entryPath))));
-                }
-            }
-        }
-
-        private async Task CreateSystemZoneRemoteDirectoriesAsync(IEnumerable<string> remoteDirectories)
-        {
-            const int maxCommandLength = 6000;
-            bool useRoot = IsSystemZoneRootDirectorySelected();
-            var command = new StringBuilder("mkdir -p");
-
-            async Task FlushAsync()
-            {
-                if (command.Length <= "mkdir -p".Length)
-                {
-                    return;
-                }
-
-                string adbCommand = useRoot
-                    ? $"shell su -c {QuoteAndroidShellArgument(command.ToString())}"
-                    : $"shell {command}";
-                var result = await RunSystemZoneAdbCommandAsync(adbCommand);
-                if (result.ExitCode != 0 || !string.IsNullOrWhiteSpace(result.StdErr))
-                {
-                    string message = string.IsNullOrWhiteSpace(result.StdErr)
-                        ? $"ADB 退出码 {result.ExitCode}"
-                        : result.StdErr.Trim();
-                    throw new InvalidOperationException(message);
-                }
-
-                command.Clear();
-                command.Append("mkdir -p");
-            }
-
-            foreach (string remoteDirectory in remoteDirectories
-                .OrderBy(path => path.Count(character => character == '/'))
-                .ThenBy(path => path, StringComparer.Ordinal))
-            {
-                string argument = " " + QuoteAndroidShellArgument(remoteDirectory);
-                if (command.Length + argument.Length > maxCommandLength)
-                {
-                    await FlushAsync();
-                }
-
-                command.Append(argument);
-            }
-
-            await FlushAsync();
-        }
-
-        // 处理文件传输功能
-        private async Task HandleFileTransfer()
-        {
-        try
-        {
-            // 打开文件选择对话框
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog()
-            {
-                Title = "选择要传输到手机的文件",
-                Filter = "所有文件 (*.*)|*.*",
-                Multiselect = true
-            };
-            
-            if (openFileDialog.ShowDialog() == true)
-            {
-                var files = openFileDialog.FileNames ?? Array.Empty<string>();
-
-                if (files.Length == 0)
-                {
-                    return;
-                }
-
-                int total = files.Length;
-                int success = 0;
-                int failed = 0;
-                long totalBytes = files.Sum(GetExistingFileSize);
-                if (totalBytes <= 0)
-                {
-                    totalBytes = total;
-                }
-
-                long transferredCompletedBytes = 0;
-                SetSystemZoneTransferFileProgress(0, total);
-                SetSystemZoneTransferProgress(0);
-                SetSystemZoneTransferSpeed(0);
-
-                for (int i = 0; i < total; i++)
-                {
-                    string selectedFilePath = files[i];
-                    string fileName = Path.GetFileName(selectedFilePath);
-                    long currentFileSize = Math.Max(0, GetExistingFileSize(selectedFilePath));
-                    long completedBytesBeforeCurrent = transferredCompletedBytes;
-                    Stopwatch transferStopwatch = Stopwatch.StartNew();
-                    double? lastSmoothedSpeed = null;
-
-                    // 构建目标路径（手机当前目录）
-                    string targetPath = lastLoadedDirectory.EndsWith("/") ? lastLoadedDirectory + fileName : lastLoadedDirectory + "/" + fileName;
-
-                    // 在文件传输日志窗口显示本次传输信息
-                    Dispatcher.Invoke(() =>
-                    {
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 开始传输: {fileName}";
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 源: {selectedFilePath}";
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 目标: {targetPath}";
-                        FileTransferLogTextBox.ScrollToEnd();
-                    });
-                    SetSystemZoneTransferFileProgress(i + 1, total);
-                    SetSystemZoneTransferSpeed(0);
-
-                    try
-                    {
-                        await ExecuteSystemZonePushAsync(
-                            selectedFilePath,
-                            targetPath,
-                            (sentBytes, currentFileTotalBytes) =>
-                            {
-                                long safeFileTotalBytes = Math.Max(1, currentFileTotalBytes);
-                                long transferredBytes = completedBytesBeforeCurrent + Math.Min(safeFileTotalBytes, sentBytes);
-                                SetSystemZoneTransferProgress(CalculateTransferPercent(transferredBytes, totalBytes));
-                                double currentSpeed = CalculateTransferSpeed(transferStopwatch, sentBytes, ref lastSmoothedSpeed);
-                                SetSystemZoneTransferSpeed(currentSpeed);
-                            });
-
-                        success++;
-                        transferredCompletedBytes += currentFileSize;
-                        SetSystemZoneTransferProgress(CalculateTransferPercent(transferredCompletedBytes, totalBytes));
-
-                        Dispatcher.Invoke(() =>
-                        {
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 传输成功: {fileName}";
-                            FileTransferLogTextBox.ScrollToEnd();
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        failed++;
-                        SetSystemZoneTransferProgress(Math.Min(
-                            99,
-                            CalculateTransferPercent(transferredCompletedBytes, totalBytes)));
-                        Dispatcher.Invoke(() =>
-                        {
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 传输失败: {fileName}";
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 错误: {ex.Message}";
-                            FileTransferLogTextBox.ScrollToEnd();
-                        });
-                    }
-                }
-
-                SetSystemZoneTransferFileProgress(total, total);
-                SetSystemZoneTransferProgress(
-                    failed == 0 && success == total
-                        ? 100
-                        : Math.Min(99, CalculateTransferPercent(transferredCompletedBytes, totalBytes)));
-                SetSystemZoneTransferSpeed(0);
-
-                // 汇总统计
-                Dispatcher.Invoke(() =>
-                {
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 传输完成：成功 {success}，失败 {failed}（共 {total}）";
-                    FileTransferLogTextBox.ScrollToEnd();
-                });
-
-                if (success > 0)
-                {
-                    await LoadFileListFromPath(currentPath);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            SetSystemZoneTransferFileProgress(0, 0);
-            SetSystemZoneTransferProgress(0);
-            SetSystemZoneTransferSpeed(0);
-            Dispatcher.Invoke(() =>
-            {
-                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 传输过程中发生异常: {ex.Message}";
-                FileTransferLogTextBox.ScrollToEnd();
-            });
-        }
-    }
-
-    private async void Button_Click_2(object sender, RoutedEventArgs e)
-    {
-        bool transferLockAcquired = false;
-        try
-        {
-            if (sender is System.Windows.Controls.Button transferOutButton)
-            {
-                transferOutButton.IsEnabled = false;
-            }
-
-            var selectedFiles = FileListTextBox.SelectedItems
-                .OfType<FileItem>()
-                .Where(item => item.IsFile)
-                .ToList();
-
-            if (selectedFiles.Count == 0)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 请先选择要传出的文件";
-                    FileTransferLogTextBox.ScrollToEnd();
-                });
-                return;
-            }
-
-            transferLockAcquired = _systemZoneTransferLock.Wait(0);
-            if (!transferLockAcquired)
-            {
-                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，请稍后再试";
-                FileTransferLogTextBox.ScrollToEnd();
-                return;
-            }
-            
-            // 打开文件夹选择对话框
-            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
-            {
-                dialog.Description = "选择文件保存路径";
-                dialog.ShowNewFolderButton = true;
-                
-                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-                {
-                    string savePath = dialog.SelectedPath;
-                    int total = selectedFiles.Count;
-                    int success = 0;
-                    int failed = 0;
-
-                    for (int i = 0; i < total; i++)
-                    {
-                        string selectedFileName = selectedFiles[i].Name;
-                        string phoneFilePath = lastLoadedDirectory.EndsWith("/") ? lastLoadedDirectory + selectedFileName : lastLoadedDirectory + "/" + selectedFileName;
-                        string computerFilePath = System.IO.Path.Combine(savePath, selectedFileName);
-                        Stopwatch transferStopwatch = Stopwatch.StartNew();
-                        double? lastSmoothedSpeed = null;
-
-                        SetSystemZoneTransferFileProgress(i + 1, total);
-                        SetSystemZoneTransferProgress(0);
-                        SetSystemZoneTransferSpeed(0);
-
-                        Dispatcher.Invoke(() =>
-                        {
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 开始传出文件: {selectedFileName}";
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 手机路径: {phoneFilePath}";
-                            FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 电脑路径: {computerFilePath}";
-                            FileTransferLogTextBox.ScrollToEnd();
-                        });
-
-                        try
-                        {
-                            await ExecuteSystemZonePullAsync(
-                                phoneFilePath,
-                                computerFilePath,
-                                (receivedBytes, totalBytes) =>
-                                {
-                                    long safeTotalBytes = Math.Max(1, totalBytes);
-                                    SetSystemZoneTransferProgress(CalculateTransferPercent(receivedBytes, safeTotalBytes));
-                                    double currentSpeed = CalculateTransferSpeed(transferStopwatch, receivedBytes, ref lastSmoothedSpeed);
-                                    SetSystemZoneTransferSpeed(currentSpeed);
-                                });
-
-                            success++;
-                            SetSystemZoneTransferProgress(100);
-                            Dispatcher.Invoke(() =>
-                            {
-                                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 文件传出成功: {selectedFileName}";
-                                FileTransferLogTextBox.ScrollToEnd();
-                            });
-                        }
-                        catch (Exception ex)
-                        {
-                            failed++;
-                            SetSystemZoneTransferProgress(success * 100d / total);
-                            Dispatcher.Invoke(() =>
-                            {
-                                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] [{i + 1}/{total}] 文件传出失败: {selectedFileName}";
-                                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 错误: {ex.Message}";
-                                FileTransferLogTextBox.ScrollToEnd();
-                            });
-                        }
-                    }
-
-                    SetSystemZoneTransferFileProgress(total, total);
-                    SetSystemZoneTransferProgress(
-                        failed == 0 && success == total
-                            ? 100
-                            : success * 100d / total);
-                    SetSystemZoneTransferSpeed(0);
-                    Dispatcher.Invoke(() =>
-                    {
-                        FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 批量传出完成：成功 {success}，失败 {failed}（共 {total}）";
-                        FileTransferLogTextBox.ScrollToEnd();
-                    });
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            SetSystemZoneTransferFileProgress(0, 0);
-            SetSystemZoneTransferProgress(0);
-            SetSystemZoneTransferSpeed(0);
-            Dispatcher.Invoke(() =>
-            {
-                FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 传出过程中发生异常: {ex.Message}";
-                FileTransferLogTextBox.ScrollToEnd();
-            });
-         }
-        finally
-        {
-            if (transferLockAcquired)
-            {
-                _systemZoneTransferLock.Release();
-            }
-
-            if (sender is System.Windows.Controls.Button transferOutButton)
-            {
-                transferOutButton.IsEnabled = true;
-            }
-        }
-    }
-
-         private void FileListTextBox_ContextMenuOpening(object sender, ContextMenuEventArgs e)
-         {
-             if (sender is not System.Windows.Controls.ListBox listBox)
-             {
-                 e.Handled = true;
-                 return;
-             }
-
-             System.Windows.Point mousePosition = Mouse.GetPosition(listBox);
-             DependencyObject? hit = listBox.InputHitTest(mousePosition) as DependencyObject;
-             ListBoxItem? itemContainer = hit as ListBoxItem;
-             itemContainer ??= hit == null ? null : FindParent<ListBoxItem>(hit);
-
-             bool isOverScrollBar = hit != null
-                 && (hit is System.Windows.Controls.Primitives.ScrollBar
-                     || FindParent<System.Windows.Controls.Primitives.ScrollBar>(hit) != null);
-             if (isOverScrollBar)
-             {
-                 e.Handled = true;
-                 return;
-             }
-
-             FileItem? contextItem = itemContainer?.DataContext as FileItem;
-             bool hasItemActions = contextItem != null && !contextItem.IsPlaceholder;
-             _systemZoneContextMenuItem = hasItemActions ? contextItem : null;
-
-             SystemZoneNewFolderMenuItem.Visibility = hasItemActions ? Visibility.Collapsed : Visibility.Visible;
-             SystemZoneNewFileMenuItem.Visibility = hasItemActions ? Visibility.Collapsed : Visibility.Visible;
-             SystemZoneRenameMenuItem.Visibility = hasItemActions ? Visibility.Visible : Visibility.Collapsed;
-             SystemZoneDeleteMenuItem.Visibility = hasItemActions && !contextItem!.IsFile
-                 ? Visibility.Visible
-                 : Visibility.Collapsed;
-
-             if (!hasItemActions)
-             {
-                 listBox.UnselectAll();
-             }
-         }
-
-         private async void CreateSystemZoneFolderMenuItem_Click(object sender, RoutedEventArgs e)
-         {
-             await CreateSystemZoneEntryAsync(isDirectory: true);
-         }
-
-         private async void CreateSystemZoneFileMenuItem_Click(object sender, RoutedEventArgs e)
-         {
-             await CreateSystemZoneEntryAsync(isDirectory: false);
-         }
-
-         private async void RenameSystemZoneItemMenuItem_Click(object sender, RoutedEventArgs e)
-         {
-             FileItem? item = _systemZoneContextMenuItem;
-             if (item == null || item.IsPlaceholder)
-             {
-                 return;
-             }
-
-             string? newName;
-             while (true)
-             {
-                 newName = ShowSystemZoneNameDialog(
-                     isDirectory: !item.IsFile,
-                     initialName: item.Name,
-                     isRename: true);
-                 if (newName == null)
-                 {
-                     return;
-                 }
-
-                 newName = newName.Trim();
-                 string? validationError = ValidateSystemZoneEntryName(newName);
-                 if (validationError == null)
-                 {
-                     break;
-                 }
-
-                 System.Windows.MessageBox.Show(
-                     validationError,
-                     "重命名",
-                     MessageBoxButton.OK,
-                     MessageBoxImage.Warning);
-             }
-
-             if (string.Equals(newName, item.Name, StringComparison.Ordinal))
-             {
-                 return;
-             }
-
-             bool transferLockAcquired = _systemZoneTransferLock.Wait(0);
-             if (!transferLockAcquired)
-             {
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，暂时无法重命名";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 return;
-             }
-
-             try
-             {
-                 string oldRemotePath = CombineAndroidPath(currentPath, item.Name);
-                 string newRemotePath = CombineAndroidPath(currentPath, newName);
-                 string quotedOldPath = QuoteAndroidShellArgument(oldRemotePath);
-                 string quotedNewPath = QuoteAndroidShellArgument(newRemotePath);
-                 const string existsMarker = "__VIOLET_ENTRY_EXISTS__";
-                 string command =
-                     $"if [ -e {quotedNewPath} ]; then echo {existsMarker}; else mv {quotedOldPath} {quotedNewPath}; fi";
-                 var result = await RunSystemZoneFileCommandAsync(command);
-
-                 if (result.StdOut.Contains(existsMarker, StringComparison.Ordinal))
-                 {
-                     System.Windows.MessageBox.Show(
-                         $"当前目录已经存在名为“{newName}”的项目。",
-                         "重命名",
-                         MessageBoxButton.OK,
-                         MessageBoxImage.Information);
-                     return;
-                 }
-
-                 if (result.ExitCode != 0 || !string.IsNullOrWhiteSpace(result.StdErr))
-                 {
-                     string errorMessage = string.IsNullOrWhiteSpace(result.StdErr)
-                         ? $"ADB 退出码 {result.ExitCode}"
-                         : result.StdErr.Trim();
-                     throw new InvalidOperationException(errorMessage);
-                 }
-
-                 FileTransferLogTextBox.Text +=
-                     $"\n[{DateTime.Now:HH:mm:ss}] 重命名成功: {item.Name} → {newName}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 _systemZoneContextMenuItem = null;
-                 await LoadFileListFromPath(currentPath);
-             }
-             catch (Exception ex)
-             {
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 重命名失败: {ex.Message}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 System.Windows.MessageBox.Show(ex.Message, "重命名失败", MessageBoxButton.OK, MessageBoxImage.Error);
-             }
-             finally
-             {
-                 _systemZoneTransferLock.Release();
-             }
-         }
-
-         private async void DeleteSystemZoneItemMenuItem_Click(object sender, RoutedEventArgs e)
-         {
-             FileItem? item = _systemZoneContextMenuItem;
-             if (item == null || item.IsPlaceholder)
-             {
-                 return;
-             }
-
-             string itemType = item.IsFile ? "文件" : "文件夹";
-             MessageBoxResult confirmation = System.Windows.MessageBox.Show(
-                 $"确定要删除{itemType}“{item.Name}”吗？{(item.IsFile ? string.Empty : "\n文件夹内的全部内容也会被删除。")}",
-                 $"删除{itemType}",
-                 MessageBoxButton.YesNo,
-                 MessageBoxImage.Warning);
-             if (confirmation != MessageBoxResult.Yes)
-             {
-                 return;
-             }
-
-             bool transferLockAcquired = _systemZoneTransferLock.Wait(0);
-             if (!transferLockAcquired)
-             {
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，暂时无法删除";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 return;
-             }
-
-             try
-             {
-                 string remotePath = CombineAndroidPath(currentPath, item.Name);
-                 string quotedRemotePath = QuoteAndroidShellArgument(remotePath);
-                 string command = item.IsFile
-                     ? $"rm -f -- {quotedRemotePath}"
-                     : $"rm -rf -- {quotedRemotePath}";
-                 var result = await RunSystemZoneFileCommandAsync(command);
-                 if (result.ExitCode != 0 || !string.IsNullOrWhiteSpace(result.StdErr))
-                 {
-                     string errorMessage = string.IsNullOrWhiteSpace(result.StdErr)
-                         ? $"ADB 退出码 {result.ExitCode}"
-                         : result.StdErr.Trim();
-                     throw new InvalidOperationException(errorMessage);
-                 }
-
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已删除{itemType}: {remotePath}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 _systemZoneContextMenuItem = null;
-                 await LoadFileListFromPath(currentPath);
-             }
-             catch (Exception ex)
-             {
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 删除失败: {ex.Message}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 System.Windows.MessageBox.Show(ex.Message, "删除失败", MessageBoxButton.OK, MessageBoxImage.Error);
-             }
-             finally
-             {
-                 _systemZoneTransferLock.Release();
-             }
-         }
-
-         private async Task CreateSystemZoneEntryAsync(bool isDirectory)
-         {
-             string? entryName;
-             while (true)
-             {
-                 entryName = ShowSystemZoneNameDialog(isDirectory);
-                 if (entryName == null)
-                 {
-                     return;
-                 }
-
-                 entryName = entryName.Trim();
-                 string? validationError = ValidateSystemZoneEntryName(entryName);
-                 if (validationError == null)
-                 {
-                     break;
-                 }
-
-                 System.Windows.MessageBox.Show(
-                     validationError,
-                     isDirectory ? "新建文件夹" : "新建文件",
-                     MessageBoxButton.OK,
-                     MessageBoxImage.Warning);
-             }
-
-             bool transferLockAcquired = _systemZoneTransferLock.Wait(0);
-             if (!transferLockAcquired)
-             {
-                 FileTransferLogTextBox.Text += $"\n[{DateTime.Now:HH:mm:ss}] 已有文件传输任务正在进行，暂时无法新建项目";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 return;
-             }
-
-             try
-             {
-                 string remotePath = CombineAndroidPath(currentPath, entryName);
-                 string quotedRemotePath = QuoteAndroidShellArgument(remotePath);
-                 const string existsMarker = "__VIOLET_ENTRY_EXISTS__";
-                 string createCommand = isDirectory
-                     ? $"mkdir {quotedRemotePath}"
-                     : $"touch {quotedRemotePath}";
-                 string command =
-                     $"if [ -e {quotedRemotePath} ]; then echo {existsMarker}; else {createCommand}; fi";
-                 var result = await RunSystemZoneFileCommandAsync(command);
-
-                 if (result.StdOut.Contains(existsMarker, StringComparison.Ordinal))
-                 {
-                     System.Windows.MessageBox.Show(
-                         $"当前目录已经存在名为“{entryName}”的项目。",
-                         isDirectory ? "新建文件夹" : "新建文件",
-                         MessageBoxButton.OK,
-                         MessageBoxImage.Information);
-                     return;
-                 }
-
-                 if (result.ExitCode != 0 || !string.IsNullOrWhiteSpace(result.StdErr))
-                 {
-                     string errorMessage = string.IsNullOrWhiteSpace(result.StdErr)
-                         ? $"ADB 退出码 {result.ExitCode}"
-                         : result.StdErr.Trim();
-                     throw new InvalidOperationException(errorMessage);
-                 }
-
-                 FileTransferLogTextBox.Text +=
-                     $"\n[{DateTime.Now:HH:mm:ss}] 已新建{(isDirectory ? "文件夹" : "文件")}: {remotePath}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 await LoadFileListFromPath(currentPath);
-             }
-             catch (Exception ex)
-             {
-                 FileTransferLogTextBox.Text +=
-                     $"\n[{DateTime.Now:HH:mm:ss}] 新建{(isDirectory ? "文件夹" : "文件")}失败: {ex.Message}";
-                 FileTransferLogTextBox.ScrollToEnd();
-                 System.Windows.MessageBox.Show(
-                     ex.Message,
-                     isDirectory ? "新建文件夹失败" : "新建文件失败",
-                     MessageBoxButton.OK,
-                     MessageBoxImage.Error);
-             }
-             finally
-             {
-                 _systemZoneTransferLock.Release();
-             }
-         }
-
-         private string? ShowSystemZoneNameDialog(
-             bool isDirectory,
-             string? initialName = null,
-             bool isRename = false)
-         {
-             string itemType = isDirectory ? "文件夹" : "文件";
-             var dialog = new Window
-             {
-                 Title = isRename ? $"重命名{itemType}" : $"新建{itemType}",
-                 Owner = this,
-                 Width = 420,
-                 Height = 190,
-                 ResizeMode = ResizeMode.NoResize,
-                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                 ShowInTaskbar = false,
-                 Background = MediaBrushes.White
-             };
-
-             var layout = new Grid { Margin = new Thickness(22, 18, 22, 18) };
-             layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-             layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-             layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-             var prompt = new TextBlock
-             {
-                 Text = isRename ? $"请输入新的{itemType}名称：" : $"请输入{itemType}名称：",
-                 FontSize = 14,
-                 Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(65, 65, 65)),
-                 Margin = new Thickness(0, 0, 0, 10)
-             };
-             Grid.SetRow(prompt, 0);
-             layout.Children.Add(prompt);
-
-             var nameTextBox = new System.Windows.Controls.TextBox
-             {
-                 Text = initialName ?? (isDirectory ? "新建文件夹" : "新建文件.txt"),
-                 Height = 34,
-                 FontSize = 14,
-                 Padding = new Thickness(8, 5, 8, 5),
-                 BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(154, 122, 243)),
-                 BorderThickness = new Thickness(1)
-             };
-             Grid.SetRow(nameTextBox, 1);
-             layout.Children.Add(nameTextBox);
-
-             var buttons = new StackPanel
-             {
-                 Orientation = System.Windows.Controls.Orientation.Horizontal,
-                 HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
-                 VerticalAlignment = VerticalAlignment.Bottom,
-                 Margin = new Thickness(0, 18, 0, 0)
-             };
-             var cancelButton = new System.Windows.Controls.Button
-             {
-                 Content = "取消",
-                 Width = 82,
-                 Height = 30,
-                 Margin = new Thickness(0, 0, 10, 0)
-             };
-             var createButton = new System.Windows.Controls.Button
-             {
-                 Content = isRename ? "确定" : "创建",
-                 Width = 82,
-                 Height = 30,
-                 Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(154, 122, 243)),
-                 Foreground = MediaBrushes.White,
-                 IsDefault = true
-             };
-             cancelButton.Click += (_, _) => dialog.DialogResult = false;
-             createButton.Click += (_, _) => dialog.DialogResult = true;
-             buttons.Children.Add(cancelButton);
-             buttons.Children.Add(createButton);
-             Grid.SetRow(buttons, 2);
-             layout.Children.Add(buttons);
-
-             dialog.Content = layout;
-             dialog.ContentRendered += (_, _) =>
-             {
-                 nameTextBox.Focus();
-                 nameTextBox.SelectAll();
-             };
-
-             return dialog.ShowDialog() == true ? nameTextBox.Text : null;
-         }
-
-         private static string? ValidateSystemZoneEntryName(string entryName)
-         {
-             if (string.IsNullOrWhiteSpace(entryName))
-             {
-                 return "名称不能为空。";
-             }
-
-             if (entryName is "." or "..")
-             {
-                 return "不能使用“.”或“..”作为名称。";
-             }
-
-             if (entryName.IndexOfAny(new[] { '/', '\\', '\r', '\n', '\0' }) >= 0)
-             {
-                 return "名称不能包含斜杠、反斜杠或换行符。";
-             }
-
-             if (Encoding.UTF8.GetByteCount(entryName) > 255)
-             {
-                 return "名称过长，UTF-8 编码后不能超过 255 字节。";
-             }
-
-             return null;
-         }
-
-         // FileListTextBox选择变化事件处理程序
-         private void FileListTextBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-         {
-             var selectedFileItem = FileListTextBox.SelectedItems
-                 .OfType<FileItem>()
-                 .LastOrDefault(item => item.IsFile);
-
-             lastSelectedFileName = selectedFileItem?.Name ?? "";
-         }
-
-         private void FileListTextBox_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-         {
-             if (e.OriginalSource is not DependencyObject source)
-             {
-                 return;
-             }
-
-             ListBoxItem itemContainer = source as ListBoxItem ?? FindParent<ListBoxItem>(source);
-             if (itemContainer?.DataContext is not FileItem fileItem)
-             {
-                 return;
-             }
-
-             if (!fileItem.IsFile)
-             {
-                 itemContainer.IsSelected = false;
-                 if (e.ClickCount == 2)
-                 {
-                     _ = OpenSystemZoneFolderAsync(fileItem);
-                 }
-                 e.Handled = true;
-                 return;
-             }
-
-             bool nextSelectedState = !itemContainer.IsSelected;
-             itemContainer.IsSelected = nextSelectedState;
-             itemContainer.Focus();
-             e.Handled = true;
-         }
-
-         private async Task OpenSystemZoneFolderAsync(FileItem selectedFileItem)
-         {
-             string folderName = selectedFileItem.Name;
-
-             string newPath;
-             if (currentPath == "/sdcard/")
-             {
-                 newPath = $"/sdcard/{folderName}/";
-             }
-             else
-             {
-                 newPath = currentPath.TrimEnd('/') + $"/{folderName}/";
-             }
-
-             await LoadFileListFromPath(newPath);
-
-             currentPath = newPath;
-             lastLoadedDirectory = newPath;
-             UpdateSystemZoneCurrentPathDisplay();
-         }
-
-         private void UpdateSystemZoneCurrentPathDisplay()
-         {
-             if (SystemZoneCurrentPathTextBlock != null)
-             {
-                 SystemZoneCurrentPathTextBlock.Text = currentPath;
-             }
-         }
-
-         private async Task LoadFileListFromPath(string path)
-         {
-             CancelSystemZoneImagePreviewLoading();
-             SetSystemZoneDirectoryLoading(true);
-             try
-             {
-                 // 查找ListBox控件
-                 var listBox = this.FindName("FileListTextBox") as System.Windows.Controls.ListBox;
-                 if (listBox == null)
-                 {
-                     listBox = FindVisualChild<System.Windows.Controls.ListBox>(this);
-                 }
- 
-                 if (listBox != null)
-                 {
-                     listBox.Items.Clear();
-                 }
-
-                 await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Render);
-                 List<FileItem>? detailedItems = await TryLoadSystemZoneFileDetailsAsync(path);
-                 if (detailedItems != null)
-                 {
-                     if (listBox != null)
-                     {
-                         listBox.Items.Clear();
-                         if (detailedItems.Count == 0)
-                         {
-                             listBox.Items.Add(new FileItem { Name = "未找到文件或目录为空", IsFile = false, IsPlaceholder = true });
-                         }
-                         else
-                         {
-                             foreach (FileItem item in detailedItems
-                                 .OrderBy(item => item.IsFile)
-                                 .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase))
-                             {
-                                 listBox.Items.Add(item);
-                             }
-                         }
-                     }
-
-                     lastLoadedDirectory = path;
-                     currentPath = path;
-                     UpdateSystemZoneCurrentPathDisplay();
-
-                     if (string.Equals(path, "/sdcard/DCIM/Camera/", StringComparison.Ordinal))
-                     {
-                         StartSystemZoneImagePreviewLoading(path, detailedItems);
-                     }
-
-                     return;
-                 }
- 
-                string adbPath = GetToolPath("adb.exe");
- 
-                 // 创建进程启动信息
-                 ProcessStartInfo startInfo = new ProcessStartInfo
-                 {
-                     FileName = adbPath,
-                    Arguments = BuildAdbArguments($"shell ls \"{path}\""),
-                     UseShellExecute = false,
-                     RedirectStandardOutput = true,
-                     RedirectStandardError = true,
-                     CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8
-                 };
- 
-                 // 启动进程
-                 using (Process process = new Process())
-                 {
-                     process.StartInfo = startInfo;
-                     process.Start();
- 
-                     // 读取输出
-                     string output = await process.StandardOutput.ReadToEndAsync();
-                     string error = await process.StandardError.ReadToEndAsync();
- 
-                     await process.WaitForExitAsync();
- 
-                     // 更新ListBox内容
-                     if (listBox != null)
-                     {
-                         listBox.Items.Clear();
-                         
-                         if (!string.IsNullOrEmpty(error))
-                         {
-                             listBox.Items.Add(new FileItem { Name = $"错误: {error}", IsFile = false, IsPlaceholder = true });
-                         }
-                         else if (!string.IsNullOrEmpty(output))
-                         {
-                             // 将输出按行分割，每个文件名作为一个项目添加到ListBox
-                             string[] files = output.Split(new char[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                             var fileItems = new List<FileItem>();
-                             
-                             foreach (string file in files)
-                             {
-                                 if (!string.IsNullOrWhiteSpace(file))
-                                 {
-                                     string fileName = file.Trim();
-                                     // 判断是否为文件（包含.符号）
-                                     bool isFile = fileName.Contains(".");
-                                     string ext = System.IO.Path.GetExtension(fileName).ToLowerInvariant();
-                                     bool isArchive = ext == ".7z" || ext == ".zip" || ext == ".rar" || ext == ".tgz";
-                                     bool isImageFile = ext == ".img";
-                                     fileItems.Add(new FileItem { Name = fileName, IsFile = isFile, IsArchive = isArchive, IsImageFile = isImageFile });
-                                 }
-                             }
-                             
-                             // 排序：文件夹优先（IsFile = false），然后是文件（IsFile = true）
-                             var sortedItems = fileItems.OrderBy(item => item.IsFile).ThenBy(item => item.Name);
-                             
-                             // 添加到 ListBox
-                             foreach (var item in sortedItems)
-                             {
-                                 listBox.Items.Add(item);
-                             }
-                             
-                             // 更新文件传输路径和当前路径
-                             lastLoadedDirectory = path;
-                             currentPath = path;
-                             UpdateSystemZoneCurrentPathDisplay();
-                         }
-                         else
-                         {
-                             listBox.Items.Add(new FileItem { Name = "未找到文件或目录为空", IsFile = false, IsPlaceholder = true });
-                         }
-                     }
-                 }
-             }
-             catch (Exception ex)
-             {
-                 // 查找ListBox并显示错误信息
-                 var listBox = this.FindName("FileListTextBox") as System.Windows.Controls.ListBox;
-                 if (listBox == null)
-                 {
-                     listBox = FindVisualChild<System.Windows.Controls.ListBox>(this);
-                 }
- 
-                 if (listBox != null)
-                 {
-                     listBox.Items.Clear();
-                     listBox.Items.Add(new FileItem { Name = $"执行命令时发生错误: {ex.Message}", IsFile = false, IsPlaceholder = true });
-                 }
-             }
-             finally
-             {
-                 SetSystemZoneDirectoryLoading(false);
-             }
-         }
-
-         private void StartSystemZoneImagePreviewLoading(string directoryPath, IEnumerable<FileItem> items)
-         {
-             var cancellation = new CancellationTokenSource();
-             _systemZoneImagePreviewCancellation = cancellation;
-             _ = LoadSystemZoneImagePreviewsAsync(directoryPath, items, cancellation.Token);
-         }
-
-         private void CancelSystemZoneImagePreviewLoading()
-         {
-             if (_systemZoneImagePreviewCancellation == null)
-             {
-                 return;
-             }
-
-            _systemZoneImagePreviewCancellation.Cancel();
-            _systemZoneImagePreviewCancellation = null;
-         }
-
-         private async Task LoadSystemZoneImagePreviewsAsync(
-             string directoryPath,
-             IEnumerable<FileItem> items,
-             CancellationToken cancellationToken)
-         {
-             using var concurrency = new SemaphoreSlim(4, 4);
-             try
-             {
-                 Task[] previewTasks = items
-                     .Where(item => item.IsFile && item.IsPreviewableImage)
-                     .Select(async item =>
-                     {
-                         bool enteredConcurrency = false;
-                         await concurrency.WaitAsync(cancellationToken);
-                         enteredConcurrency = true;
-                         try
-                         {
-                             var preview = await LoadSystemZoneImagePreviewAsync(
-                                 CombineAndroidPath(directoryPath, item.Name),
-                                 cancellationToken);
-                             if (preview != null
-                                 && !cancellationToken.IsCancellationRequested
-                                 && string.Equals(currentPath, directoryPath, StringComparison.Ordinal))
-                             {
-                                 item.PreviewImage = preview;
-                             }
-                         }
-                         finally
-                         {
-                             if (enteredConcurrency)
-                             {
-                                 concurrency.Release();
-                             }
-                         }
-                     })
-                     .ToArray();
-
-                 await Task.WhenAll(previewTasks);
-             }
-             catch (OperationCanceledException)
-             {
-                 // 切换目录后不再继续读取旧目录的缩略图。
-             }
-         }
-
-         private async Task<System.Windows.Media.Imaging.BitmapImage?> LoadSystemZoneImagePreviewAsync(
-             string remotePath,
-             CancellationToken cancellationToken)
-         {
-             return await Task.Run(async () =>
-             {
-                 Process? process = null;
-                 try
-                 {
-                     string adbPath = GetToolPath("adb.exe");
-                     var startInfo = new ProcessStartInfo
-                     {
-                         FileName = adbPath,
-                         UseShellExecute = false,
-                         RedirectStandardOutput = true,
-                         RedirectStandardError = true,
-                         CreateNoWindow = true
-                     };
-                     string selectedSerial = GetSelectedDeviceSerial();
-                     if (!string.IsNullOrWhiteSpace(selectedSerial))
-                     {
-                         startInfo.ArgumentList.Add("-s");
-                         startInfo.ArgumentList.Add(selectedSerial);
-                     }
-
-                     // exec-out 不经过 Android Shell，路径必须作为原始参数传入，不能套 Shell 引号。
-                     startInfo.ArgumentList.Add("exec-out");
-                     startInfo.ArgumentList.Add("cat");
-                     startInfo.ArgumentList.Add("--");
-                     startInfo.ArgumentList.Add(remotePath);
-
-                     process = new Process { StartInfo = startInfo };
-                     process.Start();
-                     await using var stream = new MemoryStream();
-                     Task<string> errorTask = process.StandardError.ReadToEndAsync();
-                     await process.StandardOutput.BaseStream.CopyToAsync(stream, cancellationToken);
-                     await process.WaitForExitAsync(cancellationToken);
-                     await errorTask;
-                     if (process.ExitCode != 0 || stream.Length == 0)
-                     {
-                         return null;
-                     }
-
-                     stream.Position = 0;
-                     var bitmap = new System.Windows.Media.Imaging.BitmapImage();
-                     bitmap.BeginInit();
-                     bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                     bitmap.DecodePixelWidth = 144;
-                     bitmap.StreamSource = stream;
-                     bitmap.EndInit();
-                     bitmap.Freeze();
-                     return bitmap;
-                 }
-                 catch (OperationCanceledException)
-                 {
-                     try
-                     {
-                         if (process != null && !process.HasExited)
-                         {
-                             process.Kill(entireProcessTree: true);
-                         }
-                     }
-                     catch
-                     {
-                     }
-
-                     throw;
-                 }
-                 catch
-                 {
-                     return null;
-                 }
-                 finally
-                 {
-                     process?.Dispose();
-                 }
-             }, cancellationToken);
-         }
-
-         private void SetSystemZoneDirectoryLoading(bool isLoading)
-         {
-             if (SystemZoneLoadingOverlay != null)
-             {
-                 SystemZoneLoadingOverlay.Visibility = isLoading
-                     ? Visibility.Visible
-                     : Visibility.Collapsed;
-             }
-         }
-
-         private async Task<List<FileItem>?> TryLoadSystemZoneFileDetailsAsync(string path)
-         {
-             // /sdcard 通常是指向 /storage/emulated/0 的符号链接。
-             // 保留末尾斜杠，确保 find 遍历链接目标中的内容，而不是只检查链接本身。
-             string normalizedPath = path.EndsWith('/') ? path : path + "/";
-             string quotedPath = QuoteAndroidShellArgument(normalizedPath);
-
-             const string statFormat = "%n|%Y|%f";
-             string findCommand =
-                 $"find {quotedPath} -mindepth 1 -maxdepth 1 -exec stat -c '{statFormat}' {{}} \\;";
-             string command = IsSystemZoneRootDirectorySelected()
-                 ? $"shell su -c {QuoteAndroidShellArgument(findCommand)}"
-                 : $"shell {findCommand}";
-             var result = await RunSystemZoneAdbCommandAsync(command);
-
-             if (result.ExitCode != 0 || !string.IsNullOrWhiteSpace(result.StdErr))
-             {
-                 return null;
-             }
-
-             if (string.IsNullOrWhiteSpace(result.StdOut))
-             {
-                 return new List<FileItem>();
-             }
-
-             var items = new List<FileItem>();
-             foreach (string rawLine in result.StdOut.Split(
-                 new[] { '\r', '\n' },
-                 StringSplitOptions.RemoveEmptyEntries))
-             {
-                 if (!TryParseSystemZoneFileDetail(rawLine, out FileItem item))
-                 {
-                     return null;
-                 }
-
-                 items.Add(item);
-             }
-
-             return items;
-         }
-
-         private async Task<(int ExitCode, string StdOut, string StdErr)> RunSystemZoneAdbCommandAsync(
-             string command)
-         {
-             string adbPath = GetToolPath("adb.exe");
-             var startInfo = new ProcessStartInfo
-             {
-                 FileName = adbPath,
-                 Arguments = BuildAdbArguments(command),
-                 UseShellExecute = false,
-                 RedirectStandardOutput = true,
-                 RedirectStandardError = true,
-                 CreateNoWindow = true,
-                 StandardOutputEncoding = Encoding.UTF8,
-                 StandardErrorEncoding = Encoding.UTF8
-             };
-
-             using var process = new Process { StartInfo = startInfo };
-             process.Start();
-             Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-             Task<string> errorTask = process.StandardError.ReadToEndAsync();
-             await Task.WhenAll(outputTask, errorTask, process.WaitForExitAsync());
-             return (process.ExitCode, await outputTask, await errorTask);
-         }
-
-         private static bool TryParseSystemZoneFileDetail(
-             string line,
-             out FileItem item)
-         {
-             item = null!;
-             int modeSeparator = line.LastIndexOf('|');
-             int modifiedSeparator = modeSeparator > 0
-                 ? line.LastIndexOf('|', modeSeparator - 1)
-                 : -1;
-             int pathEnd = modifiedSeparator;
-
-             if (pathEnd <= 0 || modifiedSeparator <= 0 || modeSeparator <= modifiedSeparator)
-             {
-                 return false;
-             }
-
-             string fullPath = line.Substring(0, pathEnd);
-             string modifiedText = line.Substring(modifiedSeparator + 1, modeSeparator - modifiedSeparator - 1);
-             string modeText = line.Substring(modeSeparator + 1).Trim();
-
-             if (!long.TryParse(modifiedText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long modifiedEpoch)
-                 || !int.TryParse(modeText, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int mode))
-             {
-                 return false;
-             }
-
-             string trimmedPath = fullPath.TrimEnd('/');
-             int lastSlash = trimmedPath.LastIndexOf('/');
-             string fileName = lastSlash >= 0 ? trimmedPath.Substring(lastSlash + 1) : trimmedPath;
-             if (string.IsNullOrWhiteSpace(fileName))
-             {
-                 return false;
-             }
-
-             bool isDirectory = (mode & 0xF000) == 0x4000;
-             string extension = Path.GetExtension(fileName).ToLowerInvariant();
-             string timeText = FormatSystemZoneFileTime(modifiedEpoch);
-
-             item = new FileItem
-             {
-                 Name = fileName,
-                 TimeText = isDirectory ? string.Empty : timeText,
-                 IsFile = !isDirectory,
-                 IsArchive = extension == ".7z" || extension == ".zip" || extension == ".rar" || extension == ".tgz",
-                 IsImageFile = extension == ".img",
-                 IsPreviewableImage = !isDirectory && IsSystemZonePreviewableImageFile(fileName)
-             };
-             return true;
-         }
-
-         private static bool IsSystemZonePreviewableImageFile(string fileName)
-         {
-             return Path.GetExtension(fileName).ToLowerInvariant() switch
-             {
-                 ".jpg" or ".jpeg" or ".png" or ".bmp" or ".gif" => true,
-                 _ => false
-             };
-         }
-
-         private static string FormatSystemZoneFileTime(long unixSeconds)
-         {
-             if (unixSeconds <= 0)
-             {
-                 return string.Empty;
-             }
-
-             try
-             {
-                 DateTimeOffset localTime = DateTimeOffset
-                     .FromUnixTimeSeconds(unixSeconds)
-                     .ToLocalTime();
-                 return $"{localTime:yyyy-MM-dd HH:mm}";
-             }
-             catch (ArgumentOutOfRangeException)
-             {
-                 return string.Empty;
-             }
-         }
-
-        private bool IsSystemZoneRootDirectorySelected()
-        {
-            return SystemZoneRootDirectoryRadioButton?.IsChecked == true;
-        }
-
-        private async Task<bool> HasSystemZoneRootAccessAsync()
-        {
-            var result = await RunSystemZoneAdbCommandAsync("shell su -c id");
-            return result.ExitCode == 0
-                && result.StdOut.Contains("uid=0(root)", StringComparison.Ordinal);
-        }
-
-        private void ShowSystemZoneLoadError(string message)
-        {
-            if (FindName("FileListTextBox") is System.Windows.Controls.ListBox listBox)
-            {
-                listBox.Items.Clear();
-            }
-
-            string logMessage = $"[{DateTime.Now:HH:mm:ss}] 错误: {message}";
-            FileTransferLogTextBox.Text += $"\n{logMessage}";
-            FileTransferLogTextBox.ScrollToEnd();
-        }
-
-        private async void BackButton_Click(object sender, RoutedEventArgs e)
-        {
-            string topLevelPath = IsSystemZoneRootDirectorySelected() ? "/" : "/sdcard/";
-            if (currentPath != topLevelPath)
-            {
-                int lastSlash = currentPath.TrimEnd('/').LastIndexOf('/');
-                string parentPath = currentPath.Substring(0, lastSlash + 1);
-                if (string.IsNullOrEmpty(parentPath))
-                {
-                    parentPath = topLevelPath;
-                }
-                await LoadFileListFromPath(parentPath);
-            }
-        }
-
-        private async void RefreshButton_Click(object sender, RoutedEventArgs e)
-        {
-            await LoadFileListFromPath(currentPath);
-        }
-
-        private async void LoadSystemZoneLocationButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (IsSystemZoneRootDirectorySelected())
-            {
-                if (!await HasSystemZoneRootAccessAsync())
-                {
-                    ShowSystemZoneLoadError("Shell无法获取ROOT权限，请确保手机端已授予Shell ROOT权限。");
-                    return;
-                }
-
-                await LoadFileListFromPath("/");
-                return;
-            }
-
-            if (SystemZoneCameraDirectoryRadioButton?.IsChecked == true)
-            {
-                await LoadFileListFromPath("/sdcard/DCIM/Camera/");
-                return;
-            }
-
-            await LoadFileListFromPath("/sdcard/");
-        }
-
-        private async void DeleteSelectedFilesButton_Click(object sender, RoutedEventArgs e)
-        {
-            var selectedFiles = FileListTextBox.SelectedItems
-                .OfType<FileItem>()
-                .Where(item => item.IsFile)
-                .ToList();
-
-            if (selectedFiles.Count == 0)
-            {
-                System.Windows.MessageBox.Show(
-                    "请先选择要删除的文件。",
-                    "删除文件",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Information);
-                return;
-            }
-
-            if (sender is System.Windows.Controls.Button deleteButton)
-            {
-                deleteButton.IsEnabled = false;
-            }
-
-            int successCount = 0;
-            int failedCount = 0;
-            using var progressCancellation = new CancellationTokenSource();
-            Task progressAnimation = AnimateDeleteProgressAsync(
-                selectedFiles.Count,
-                progressCancellation.Token);
-
-            try
-            {
-                FileTransferLogTextBox.Text +=
-                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 开始删除 {selectedFiles.Count} 个文件\n";
-                FileTransferLogTextBox.ScrollToEnd();
-
-                foreach (FileItem file in selectedFiles)
-                {
-                    SetSystemZoneTransferFileProgress(
-                        successCount + failedCount + 1,
-                        selectedFiles.Count);
-
-                    string remotePath = currentPath.TrimEnd('/') + "/" + file.Name;
-                    var commandResult = await RunSystemZoneFileCommandAsync(
-                        $"rm -f -- {QuoteAndroidShellArgument(remotePath)}");
-                    bool succeeded = commandResult.ExitCode == 0
-                        && string.IsNullOrWhiteSpace(commandResult.StdErr);
-                    string result = string.IsNullOrWhiteSpace(commandResult.StdErr)
-                        ? commandResult.StdOut
-                        : commandResult.StdErr;
-
-                    if (succeeded)
-                    {
-                        successCount++;
-                        FileTransferLogTextBox.Text +=
-                            $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 删除成功: {file.Name}\n";
-                    }
-                    else
-                    {
-                        failedCount++;
-                        FileTransferLogTextBox.Text +=
-                            $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 删除失败: {file.Name}，{result.Trim()}\n";
-                    }
-
-                    FileTransferLogTextBox.ScrollToEnd();
-                }
-
-                progressCancellation.Cancel();
-                await progressAnimation;
-                if (failedCount == 0)
-                {
-                    await CompleteDeleteProgressAsync(selectedFiles.Count);
-                }
-                else
-                {
-                    SetSystemZoneTransferFileProgress(selectedFiles.Count, selectedFiles.Count);
-                    SetSystemZoneTransferProgress(Math.Min(
-                        99,
-                        successCount * 100d / selectedFiles.Count));
-                    UpdateSystemZoneProgressBarTag(speedText: "删除未全部完成");
-                }
-                await LoadFileListFromPath(currentPath);
-
-                FileTransferLogTextBox.Text +=
-                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 删除完成：成功 {successCount}，失败 {failedCount}\n";
-                FileTransferLogTextBox.ScrollToEnd();
-
-                if (failedCount > 0)
-                {
-                    System.Windows.MessageBox.Show(
-                        $"删除完成：成功 {successCount} 个，失败 {failedCount} 个。\n请查看传输日志了解失败原因。",
-                        "删除文件",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Warning);
-                }
-            }
-            catch (Exception ex)
-            {
-                progressCancellation.Cancel();
-                await progressAnimation;
-
-                FileTransferLogTextBox.Text +=
-                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 删除文件时发生错误: {ex.Message}\n";
-                FileTransferLogTextBox.ScrollToEnd();
-
-                System.Windows.MessageBox.Show(
-                    $"删除文件失败：{ex.Message}",
-                    "删除文件",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-            }
-            finally
-            {
-                if (sender is System.Windows.Controls.Button button)
-                {
-                    button.IsEnabled = true;
-                }
-            }
-        }
-
-        private async Task AnimateDeleteProgressAsync(int totalFileCount, CancellationToken cancellationToken)
-        {
-            SetSystemZoneTransferProgress(0);
-            SetSystemZoneTransferFileProgress(0, totalFileCount);
-            UpdateSystemZoneProgressBarTag(speedText: "正在删除...");
-
-            double progress = 0;
-            try
-            {
-                while (progress < 90)
-                {
-                    await Task.Delay(35, cancellationToken);
-                    progress += Math.Max(0.6, (90 - progress) * 0.055);
-                    SetSystemZoneTransferProgress(Math.Min(progress, 90));
-                    UpdateSystemZoneProgressBarTag(speedText: "正在删除...");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
-        private async Task CompleteDeleteProgressAsync(int totalFileCount)
-        {
-            double start = Math.Max(90, SystemZoneProgressBar?.Value ?? 90);
-            for (double progress = start; progress < 100; progress += 2)
-            {
-                SetSystemZoneTransferProgress(progress);
-                UpdateSystemZoneProgressBarTag(speedText: "正在完成...");
-                await Task.Delay(20);
-            }
-
-            SetSystemZoneTransferProgress(100);
-            SetSystemZoneTransferFileProgress(totalFileCount, totalFileCount);
-            UpdateSystemZoneProgressBarTag(speedText: "删除完成");
-        }
-
-        private static string QuoteAndroidShellArgument(string value)
-        {
-            return "'" + value.Replace("'", "'\\''") + "'";
-        }
-
-        private async void InstallApkButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (sender is System.Windows.Controls.Button installButton)
-            {
-                installButton.IsEnabled = false;
-            }
-
-            try
-            {
-                Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog();
-                openFileDialog.Filter = "APK 安装包 (*.apk;*.apk.*)|*.apk;*.apk.*|所有文件 (*.*)|*.*";
-                openFileDialog.Multiselect = true; // 启用多文件选择
-
-                if (openFileDialog.ShowDialog() == true)
-                {
-                    string[] apkPaths = openFileDialog.FileNames
-                        .Where(IsRecognizedApkPackagePath)
-                        .ToArray();
-                    int ignoredFileCount = openFileDialog.FileNames.Length - apkPaths.Length;
-
-                    if (apkPaths.Length == 0)
-                    {
-                        System.Windows.MessageBox.Show(
-                            "请选择 .apk 或 .apk.数字 格式的安装包。",
-                            "安装 APK",
-                            MessageBoxButton.OK,
-                            MessageBoxImage.Warning);
-                        return;
-                    }
-
-                    if (ignoredFileCount > 0)
-                    {
-                        FileTransferLogTextBox.Text +=
-                            $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 已忽略 {ignoredFileCount} 个无法识别的文件\n";
-                    }
-
-                    string adbPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools", "adb.exe");
-                    string selectedSerial = GetSelectedDeviceSerial();
-
-                    if (!File.Exists(adbPath))
-                    {
-                        FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 错误: 找不到ADB工具: {adbPath}\n请确保platform-tools文件夹存在于程序目录中。\n";
-                        FileTransferLogTextBox.ScrollToEnd();
-                        return;
-                    }
-
-                    // 检查ROOT权限
-                    FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 检查ROOT权限...\n";
-                    FileTransferLogTextBox.ScrollToEnd();
-
-                    string rootCheckResult = await ExecuteAdbCommandWithOutput(
-                        "shell \"su -c 'echo root_check'\"");
-                    bool hasRoot = rootCheckResult.Contains("root_check");
-
-                    if (hasRoot)
-                    {
-                        FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ROOT权限已授予，将使用静默安装\n";
-                    }
-                    else
-                    {
-                        FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 未获取ROOT权限，将使用普通安装\n";
-                    }
-                    FileTransferLogTextBox.ScrollToEnd();
-
-                    FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 开始批量安装APK，共选择了 {apkPaths.Length} 个文件\n";
-                    FileTransferLogTextBox.ScrollToEnd();
-
-                    // 异步排队安装每个APK文件
-                    await InstallApksSequentially(apkPaths, adbPath, selectedSerial, hasRoot);
-                }
-            }
-            finally
-            {
-                if (sender is System.Windows.Controls.Button button)
-                {
-                    button.IsEnabled = true;
-                }
-            }
-        }
-
-        private static bool IsRecognizedApkPackagePath(string path)
-        {
-            string fileName = Path.GetFileName(path);
-            return Regex.IsMatch(
-                fileName,
-                @"\.apk(?:\.\d+)?$",
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        }
-        
-        private async Task InstallApksSequentially(string[] apkPaths, string adbPath, string selectedSerial, bool hasRoot)
-        {
-            int totalFiles = apkPaths.Length;
-            int currentIndex = 0;
-            int successCount = 0;
-            int failedCount = 0;
-
-            SetSystemZoneTransferFileProgress(0, totalFiles);
-            SetSystemZoneTransferProgress(0);
-            UpdateSystemZoneProgressBarTag(speedText: "准备安装...");
-
-            foreach (string apkPath in apkPaths)
-            {
-                currentIndex++;
-                string fileName = Path.GetFileName(apkPath);
-                bool installedSuccessfully = false;
-                using var progressCancellation = new CancellationTokenSource();
-                Task progressAnimation = AnimateApkInstallProgressAsync(
-                    currentIndex,
-                    totalFiles,
-                    progressCancellation.Token);
-                
-                FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 正在安装 ({currentIndex}/{totalFiles}): {fileName}\n";
-                FileTransferLogTextBox.ScrollToEnd();
-                
-                try
-                {
-                    if (hasRoot)
-                    {
-                        // 使用ROOT静默安装
-                        string tempPath = $"/data/local/tmp/violet_install_{currentIndex}.apk";
-                        
-                        // 推送APK到设备
-                        string pushResult = await ExecuteAdbCommandWithOutput(
-                            $"push \"{apkPath}\" \"{tempPath}\"");
-                        if (pushResult.Contains("error", StringComparison.OrdinalIgnoreCase) ||
-                            pushResult.Contains("failed", StringComparison.OrdinalIgnoreCase))
-                        {
-                            throw new InvalidOperationException($"APK 推送失败: {pushResult.Trim()}");
-                        }
-
-                        string installResult;
-                        try
-                        {
-                            // 临时文件名只包含 ASCII 字母、数字和下划线，避免 shell 特殊字符。
-                            installResult = await ExecuteAdbCommandWithOutput(
-                                $"shell \"su -c 'pm install -r -g {tempPath}'\"");
-                        }
-                        finally
-                        {
-                            await ExecuteAdbCommand(
-                                $"shell \"su -c 'rm -f {tempPath}'\"");
-                        }
-                        
-                        // 判断安装结果
-                        installedSuccessfully = installResult.Contains(
-                            "Success",
-                            StringComparison.OrdinalIgnoreCase);
-                        string status = installedSuccessfully ? "成功" : "失败";
-                        
-                        FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {fileName} 安装{status}\n";
-                        if (!installedSuccessfully)
-                        {
-                            FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 详情: {installResult.Trim()}\n";
-                        }
-                    }
-                    else
-                    {
-                        // 使用普通安装
-                        string arguments = $"install \"{apkPath}\"";
-                        if (!string.IsNullOrEmpty(selectedSerial))
-                        {
-                            arguments = $"-s {selectedSerial} install \"{apkPath}\"";
-                        }
-                        
-                        var process = new Process
-                        {
-                            StartInfo = new ProcessStartInfo
-                            {
-                                FileName = adbPath,
-                                Arguments = arguments,
-                                RedirectStandardOutput = true,
-                                RedirectStandardError = true,
-                                UseShellExecute = false,
-                                CreateNoWindow = true,
-                            }
-                        };
-                        
-                        process.Start();
-                        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-                        Task<string> errorTask = process.StandardError.ReadToEndAsync();
-                        await process.WaitForExitAsync();
-
-                        string output = await outputTask;
-                        string error = await errorTask;
-                        
-                        string result = string.IsNullOrEmpty(error) ? output : $"{output}\n错误信息: {error}";
-                        
-                        installedSuccessfully =
-                            process.ExitCode == 0 &&
-                            output.Contains("Success", StringComparison.OrdinalIgnoreCase);
-                        string status = installedSuccessfully ? "成功" : "失败";
-                        
-                        FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {fileName} 安装{status}: {result.Trim()}\n";
-                    }
-
-                    if (installedSuccessfully)
-                    {
-                        successCount++;
-                    }
-                    else
-                    {
-                        failedCount++;
-                    }
-                    
-                    FileTransferLogTextBox.ScrollToEnd();
-                }
-                catch (Exception ex)
-                {
-                    failedCount++;
-                    FileTransferLogTextBox.Text += $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 安装 {fileName} 时发生错误: {ex.Message}\n";
-                    FileTransferLogTextBox.ScrollToEnd();
-                }
-                finally
-                {
-                    progressCancellation.Cancel();
-                    await progressAnimation;
-                    await CompleteApkInstallFileProgressAsync(currentIndex, totalFiles);
-                }
-                
-                // 在安装下一个APK之前稍作延迟
-                if (currentIndex < totalFiles)
-                {
-                    await Task.Delay(500);
-                }
-            }
-            
-            SetSystemZoneTransferProgress(100);
-            SetSystemZoneTransferFileProgress(totalFiles, totalFiles);
-            UpdateSystemZoneProgressBarTag(speedText: "安装完成");
-            FileTransferLogTextBox.Text +=
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 批量APK安装完成：成功 {successCount}，失败 {failedCount}（共 {totalFiles}）\n";
-            FileTransferLogTextBox.ScrollToEnd();
-        }
-
-        private async Task AnimateApkInstallProgressAsync(
-            int currentFileIndex,
-            int totalFileCount,
-            CancellationToken cancellationToken)
-        {
-            double start = (currentFileIndex - 1) * 100d / totalFileCount;
-            double target = currentFileIndex * 100d / totalFileCount;
-            double simulatedTarget = Math.Max(start, target - Math.Min(2, 100d / totalFileCount * 0.15));
-            double progress = start;
-
-            SetSystemZoneTransferFileProgress(currentFileIndex, totalFileCount);
-            SetSystemZoneTransferProgress(start);
-            UpdateSystemZoneProgressBarTag(speedText: "正在安装...");
-
-            try
-            {
-                while (progress < simulatedTarget)
-                {
-                    await Task.Delay(40, cancellationToken);
-                    progress += Math.Max(0.25, (simulatedTarget - progress) * 0.055);
-                    SetSystemZoneTransferProgress(Math.Min(progress, simulatedTarget));
-                    UpdateSystemZoneProgressBarTag(speedText: "正在安装...");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
-        private async Task CompleteApkInstallFileProgressAsync(
-            int currentFileIndex,
-            int totalFileCount)
-        {
-            double target = currentFileIndex * 100d / totalFileCount;
-            double current = SystemZoneProgressBar?.Value ?? target;
-            double step = Math.Max(0.5, (target - current) / 5);
-
-            while (current < target)
-            {
-                current = Math.Min(target, current + step);
-                SetSystemZoneTransferProgress(current);
-                UpdateSystemZoneProgressBarTag(speedText: "正在完成...");
-                await Task.Delay(20);
-            }
-
-            SetSystemZoneTransferFileProgress(currentFileIndex, totalFileCount);
-        }
-
-         private async void FileListTextBox_MouseDoubleClick(object sender, MouseButtonEventArgs e)
-         {
-             if (e.OriginalSource is not DependencyObject source)
-             {
-                 return;
-             }
-
-             ListBoxItem itemContainer = source as ListBoxItem ?? FindParent<ListBoxItem>(source);
-             if (itemContainer?.DataContext is FileItem selectedFileItem)
-             {
-                 // 只处理文件夹的双击事件
-                 if (!selectedFileItem.IsFile)
-                 {
-                     await OpenSystemZoneFolderAsync(selectedFileItem);
-                 }
-             }
-         }
-
-        private void SelectOfpFileButton_Click(object sender, RoutedEventArgs e)
-        {
-            var dialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择 OPPO/Realme OFP 固件",
-                Filter = "OFP 固件 (*.ofp)|*.ofp|所有文件 (*.*)|*.*",
-                Multiselect = false
-            };
-
-            if (dialog.ShowDialog() == true)
-            {
-                OfpFilePathTextBox.Text = dialog.FileName;
-                OfpExtractProgressBar.Value = 0;
-                AppendSuperLog($"[OFP] 已选择固件: {dialog.FileName}");
-            }
-        }
-
-        private async void StartOfpExtractButton_Click(object sender, RoutedEventArgs e)
-        {
-            string sourcePath = OfpFilePathTextBox.Text.Trim();
-            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
-            {
-                System.Windows.MessageBox.Show(
-                    "请先选择有效的 OFP 固件文件。",
-                    "解包 OFP",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                return;
-            }
-
-            string defaultOutputDirectory = Path.Combine(
-                Path.GetDirectoryName(sourcePath) ?? AppDomain.CurrentDomain.BaseDirectory,
-                Path.GetFileNameWithoutExtension(sourcePath) + "_解包");
-
-            using var folderDialog = new System.Windows.Forms.FolderBrowserDialog
-            {
-                Description = "选择 OFP 解包输出目录",
-                SelectedPath = Directory.Exists(defaultOutputDirectory)
-                    ? defaultOutputDirectory
-                    : Path.GetDirectoryName(sourcePath)
-            };
-
-            if (folderDialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
-            {
-                return;
-            }
-
-            string outputDirectory = Path.Combine(
-                folderDialog.SelectedPath,
-                Path.GetFileNameWithoutExtension(sourcePath) + "_解包");
-
-            StartOfpExtractButton.IsEnabled = false;
-            SelectOfpFileButton.IsEnabled = false;
-            OfpExtractProgressBar.Value = 0;
-            AppendSuperLog("=== 开始解包 OFP ===");
-            AppendSuperLog($"[OFP] 源文件: {sourcePath}");
-            AppendSuperLog($"[OFP] 输出目录: {outputDirectory}");
-            AppendSuperLog("[OFP] 正在读取固件...");
-
-            var progress = new Progress<OfpExtractProgress>(value =>
-            {
-                OfpExtractProgressBar.Value = Math.Clamp(value.Percent, 0, 100);
-                AppendSuperLog($"[OFP] {value.Message} ({value.Percent:0}%)");
-            });
-
-            try
-            {
-                await OppoOfpExtractor.ExtractAsync(sourcePath, outputDirectory, progress);
-                int superFileCount = Directory
-                    .EnumerateFiles(outputDirectory, "super*", SearchOption.AllDirectories)
-                    .Count();
-                if (superFileCount > 1)
-                {
-                    try
-                    {
-                        SetSelectedOfpSuperSegments(
-                            OfpSegmentedSuperMerger.FindSegments(outputDirectory));
-                    }
-                    catch
-                    {
-                        _selectedOfpSuperSegments = Array.Empty<string>();
-                        OfpSuperSegmentsTextBox.Text = "请选择 Super 分段文件";
-                    }
-                }
-                OfpExtractProgressBar.Value = 100;
-                AppendSuperLog(superFileCount > 0
-                    ? $"COLOR:Green|[OFP] 解包完成，已提取 {superFileCount} 个 super 文件"
-                    : "COLOR:Orange|[OFP] 解包完成，未发现 super 文件");
-                AppendSuperLog("=== OFP 解包任务结束 ===");
-
-                System.Windows.MessageBox.Show(
-                    superFileCount > 0
-                        ? $"OFP 解包完成，共提取 {superFileCount} 个 super 文件。\n\n输出目录：{outputDirectory}"
-                        : $"OFP 解包完成，但文件表中未发现 super 文件。\n请检查 ProFile.xml 和 super_map.csv.txt。\n\n输出目录：{outputDirectory}",
-                    "解包 OFP",
-                    MessageBoxButton.OK,
-                    superFileCount > 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
-
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = outputDirectory,
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                AppendSuperLog($"COLOR:Red|[OFP] 解包失败: {ex.Message}");
-                System.Windows.MessageBox.Show(
-                    $"OFP 解包失败：{ex.Message}",
-                    "解包 OFP",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-            }
-            finally
-            {
-                StartOfpExtractButton.IsEnabled = true;
-                SelectOfpFileButton.IsEnabled = true;
-            }
-        }
-
-        private string[] _selectedOfpSuperSegments = Array.Empty<string>();
-
-        private void SetSelectedOfpSuperSegments(IReadOnlyList<string> segments)
-        {
-            _selectedOfpSuperSegments = segments.ToArray();
-            string fileNames = string.Join(
-                "、",
-                _selectedOfpSuperSegments.Select(Path.GetFileName));
-            OfpSuperSegmentsTextBox.Text =
-                $"已选择 {_selectedOfpSuperSegments.Length} 个：{fileNames}";
-        }
-
-        private void SelectOfpSuperPartsFolderButton_Click(object sender, RoutedEventArgs e)
-        {
-            var dialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择 Super 分段文件",
-                Filter = "Super 分段镜像 (super*.img;super*.bin;super*.raw;super*.sparse)|super*.img;super*.bin;super*.raw;super*.sparse|镜像文件 (*.img;*.bin;*.raw;*.sparse)|*.img;*.bin;*.raw;*.sparse|所有文件 (*.*)|*.*",
-                Multiselect = true
-            };
-
-            if (dialog.ShowDialog() != true)
-                return;
-
-            try
-            {
-                IReadOnlyList<string> segments;
-                IReadOnlyList<OfpSuperVariant> variants =
-                    OfpSegmentedSuperMerger.FindMappedVariants(dialog.FileNames);
-                if (variants.Count > 0)
-                {
-                    OfpSuperVariant? variant = variants.Count == 1
-                        ? variants[0]
-                        : ShowOfpSuperVariantDialog(variants);
-                    if (variant == null)
-                        return;
-
-                    segments = variant.SegmentPaths;
-                    AppendSuperLog(
-                        $"COLOR:Purple|[OFP Super] 已选择版本：{variant.DisplayName}");
-                }
-                else
-                {
-                    segments =
-                        OfpSegmentedSuperMerger.ValidateAndSortSegments(dialog.FileNames);
-                }
-
-                SetSelectedOfpSuperSegments(segments);
-                AppendSuperLog($"[OFP Super] 已识别 {segments.Count} 个分段");
-            }
-            catch (Exception ex)
-            {
-                _selectedOfpSuperSegments = Array.Empty<string>();
-                OfpSuperSegmentsTextBox.Text = "请选择 Super 分段文件";
-                AppendSuperLog($"COLOR:Orange|[OFP Super] {ex.Message}");
-            }
-        }
-
-        private OfpSuperVariant? ShowOfpSuperVariantDialog(
-            IReadOnlyList<OfpSuperVariant> variants)
-        {
-            var window = new System.Windows.Window
-            {
-                Title = "选择 Super 版本",
-                Owner = this,
-                Width = 390,
-                Height = 190,
-                ResizeMode = ResizeMode.NoResize,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                ShowInTaskbar = false,
-                Background = System.Windows.Media.Brushes.White
-            };
-            var root = new System.Windows.Controls.Grid
-            {
-                Margin = new Thickness(18)
-            };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(12) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(18) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var message = new TextBlock
-            {
-                Text = "检测到多个运营商版本，请选择需要合并的 Super：",
-                Foreground = new SolidColorBrush(MediaColor.FromRgb(51, 51, 51)),
-                TextWrapping = TextWrapping.Wrap
-            };
-            System.Windows.Controls.Grid.SetRow(message, 0);
-
-            var selector = new System.Windows.Controls.ComboBox
-            {
-                ItemsSource = variants,
-                DisplayMemberPath = nameof(OfpSuperVariant.DisplayName),
-                SelectedIndex = 0,
-                Height = 32,
-                VerticalContentAlignment = VerticalAlignment.Center
-            };
-            System.Windows.Controls.Grid.SetRow(selector, 2);
-
-            var buttons = new System.Windows.Controls.StackPanel
-            {
-                Orientation = System.Windows.Controls.Orientation.Horizontal,
-                HorizontalAlignment = System.Windows.HorizontalAlignment.Right
-            };
-            var cancelButton = new System.Windows.Controls.Button
-            {
-                Content = "取消",
-                Width = 82,
-                Height = 30,
-                Margin = new Thickness(0, 0, 8, 0)
-            };
-            var confirmButton = new System.Windows.Controls.Button
-            {
-                Content = "确认",
-                Width = 82,
-                Height = 30,
-                Background = new SolidColorBrush(MediaColor.FromRgb(224, 188, 245)),
-                BorderBrush = new SolidColorBrush(MediaColor.FromRgb(224, 188, 245)),
-                Foreground = System.Windows.Media.Brushes.White
-            };
-            cancelButton.Click += (_, _) => window.DialogResult = false;
-            confirmButton.Click += (_, _) => window.DialogResult = true;
-            buttons.Children.Add(cancelButton);
-            buttons.Children.Add(confirmButton);
-            System.Windows.Controls.Grid.SetRow(buttons, 4);
-
-            root.Children.Add(message);
-            root.Children.Add(selector);
-            root.Children.Add(buttons);
-            window.Content = root;
-
-            return window.ShowDialog() == true
-                ? selector.SelectedItem as OfpSuperVariant
-                : null;
-        }
-
-        private async void StartMergeOfpSuperButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_selectedOfpSuperSegments.Length < 2)
-            {
-                AppendSuperLog("COLOR:Red|[OFP Super] 请至少选择两个 Super 分段文件");
-                return;
-            }
-
-            string outputDirectory =
-                Path.GetDirectoryName(_selectedOfpSuperSegments[0])
-                ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            string outputPath = Path.Combine(outputDirectory, "super_merged.img");
-
-            if (File.Exists(outputPath))
-            {
-                MessageBoxResult overwrite = System.Windows.MessageBox.Show(
-                    $"输出文件已存在，是否覆盖？\n\n{outputPath}",
-                    "合并 OFP 分段 Super",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Question);
-                if (overwrite != MessageBoxResult.Yes)
-                    return;
-            }
-
-            string originalButtonText = StartMergeOfpSuperButton.Content?.ToString() ?? "开始合并";
-            StartMergeOfpSuperButton.IsEnabled = false;
-            SelectOfpSuperSegmentsButton.IsEnabled = false;
-            StartMergeOfpSuperButton.Content = "准备中";
-            AppendSuperLog("=== 开始合并 OFP 分段 Super ===");
-            AppendSuperLog($"[OFP Super] 分段数量: {_selectedOfpSuperSegments.Length}");
-            AppendSuperLog($"[OFP Super] 输出文件: {outputPath}");
-
-            double lastDisplayedPercent = -1;
-            var progress = new Progress<OfpSuperMergeProgress>(value =>
-            {
-                double percent = Math.Clamp(value.Percent, 0, 100);
-                if (percent >= 100 || percent - lastDisplayedPercent >= 1)
-                {
-                    StartMergeOfpSuperButton.Content = $"{percent:0}%";
-                    lastDisplayedPercent = percent;
-                }
-                if (!string.IsNullOrWhiteSpace(value.Message))
-                    AppendSuperLog($"[OFP Super] {value.Message}");
-            });
-
-            try
-            {
-                OfpSuperMergeResult result = await OfpSegmentedSuperMerger.MergeAsync(
-                    _selectedOfpSuperSegments,
-                    outputPath,
-                    progress);
-                string outputSize = FormatFileSize(result.OutputLength);
-                AppendSuperLog(
-                    $"COLOR:Green|[OFP Super] 合并完成：{result.SegmentCount} 个分段，完整大小 {outputSize}");
-                if (result.SourceIsSparse)
-                {
-                    AppendSuperLog(result.OutputUsesNtfsSparse
-                        ? "[OFP Super] 已启用 NTFS 稀疏输出，未写入区域不占用实际磁盘空间"
-                        : "COLOR:Orange|[OFP Super] 当前文件系统不支持稀疏输出，文件将占用完整空间");
-                }
-                AppendSuperLog($"COLOR:Green|[OFP Super] 保存路径: {result.OutputPath}");
-                AppendSuperLog("=== OFP 分段 Super 合并任务结束 ===");
-            }
-            catch (Exception ex)
-            {
-                AppendSuperLog($"COLOR:Red|[OFP Super] 合并失败: {ex.Message}");
-            }
-            finally
-            {
-                StartMergeOfpSuperButton.Content = originalButtonText;
-                StartMergeOfpSuperButton.IsEnabled = true;
-                SelectOfpSuperSegmentsButton.IsEnabled = true;
-            }
-        }
-
-        private void SelectOpsFileButton_Click(object sender, RoutedEventArgs e)
-        {
-            var dialog = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择一加 OPS 固件",
-                Filter = "OPS 固件 (*.ops)|*.ops|所有文件 (*.*)|*.*",
-                Multiselect = false
-            };
-
-            if (dialog.ShowDialog() == true)
-            {
-                OpsFilePathTextBox.Text = dialog.FileName;
-                OpsExtractProgressBar.Value = 0;
-                AppendSuperLog($"[OPS] 已选择固件: {dialog.FileName}");
-            }
-        }
-
-        private async void StartOpsExtractButton_Click(object sender, RoutedEventArgs e)
-        {
-            string sourcePath = OpsFilePathTextBox.Text.Trim();
-            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
-            {
-                System.Windows.MessageBox.Show(
-                    "请先选择有效的 OPS 固件文件。",
-                    "解包 OPS",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                return;
-            }
-
-            string defaultOutputDirectory = Path.Combine(
-                Path.GetDirectoryName(sourcePath) ?? AppDomain.CurrentDomain.BaseDirectory,
-                Path.GetFileNameWithoutExtension(sourcePath) + "_解包");
-
-            using var folderDialog = new System.Windows.Forms.FolderBrowserDialog
-            {
-                Description = "选择 OPS 解包输出目录",
-                SelectedPath = Directory.Exists(defaultOutputDirectory)
-                    ? defaultOutputDirectory
-                    : Path.GetDirectoryName(sourcePath)
-            };
-
-            if (folderDialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
-            {
-                return;
-            }
-
-            string outputDirectory = Path.Combine(
-                folderDialog.SelectedPath,
-                Path.GetFileNameWithoutExtension(sourcePath) + "_解包");
-
-            StartOpsExtractButton.IsEnabled = false;
-            SelectOpsFileButton.IsEnabled = false;
-            OpsExtractProgressBar.Value = 0;
-            AppendSuperLog("=== 开始解包 OPS ===");
-            AppendSuperLog($"[OPS] 源文件: {sourcePath}");
-            AppendSuperLog($"[OPS] 输出目录: {outputDirectory}");
-            AppendSuperLog("[OPS] 正在识别 MBox 密钥...");
-
-            var progress = new Progress<OpsExtractProgress>(value =>
-            {
-                OpsExtractProgressBar.Value = Math.Clamp(value.Percent, 0, 100);
-                AppendSuperLog($"[OPS] {value.Message} ({value.Percent:0}%)");
-            });
-
-            try
-            {
-                await OnePlusOpsExtractor.ExtractAsync(sourcePath, outputDirectory, progress);
-                int extractedFileCount = Directory
-                    .EnumerateFiles(outputDirectory, "*", SearchOption.AllDirectories)
-                    .Count();
-                OpsExtractProgressBar.Value = 100;
-                AppendSuperLog($"COLOR:Green|[OPS] 解包完成，共输出 {extractedFileCount} 个文件");
-                AppendSuperLog("=== OPS 解包任务结束 ===");
-
-                System.Windows.MessageBox.Show(
-                    $"OPS 解包完成，共输出 {extractedFileCount} 个文件。\n\n输出目录：{outputDirectory}",
-                    "解包 OPS",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Information);
-
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = outputDirectory,
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                AppendSuperLog($"COLOR:Red|[OPS] 解包失败: {ex.Message}");
-                System.Windows.MessageBox.Show(
-                    $"OPS 解包失败：{ex.Message}",
-                    "解包 OPS",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-            }
-            finally
-            {
-                StartOpsExtractButton.IsEnabled = true;
-                SelectOpsFileButton.IsEnabled = true;
-            }
-        }
-
-        private void SelectImageDirButton_Click(object sender, RoutedEventArgs e)
-        {
-            var folderDialog = new System.Windows.Forms.FolderBrowserDialog
-            {
-                Description = "请选择包含需要刷入镜像的文件夹",
-                ShowNewFolderButton = false
-            };
-
-            if (folderDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-            {
-                string selectedPath = folderDialog.SelectedPath;
-                var tb = this.FindName("ImageDirTextBox") as System.Windows.Controls.TextBox;
-                if (tb != null)
-                {
-                    tb.Text = selectedPath;
-                    tb.Foreground = System.Windows.Media.Brushes.Black;
-                }
-            }
-        }
-
-        private void GenerateFlashScriptButton_Click(object sender, RoutedEventArgs e)
-        {
-            var tb = this.FindName("ImageDirTextBox") as System.Windows.Controls.TextBox;
-            var logBox = this.FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-            void Log(string msg)
-            {
-                if (logBox != null)
-                {
-                    logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}\n");
-                    logBox.ScrollToEnd();
-                }
-            }
-
-            string folderPath = (tb?.Text ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(folderPath) || !System.IO.Directory.Exists(folderPath))
-            {
-                Log("错误：请选择有效的镜像目录");
-                return;
-            }
-
-            Log($"开始生成脚本，目录：{folderPath}");
-
-            // 收集镜像文件（支持 .img 和 .bin）
-            string[] imgFiles = Array.Empty<string>();
-            string[] binFiles = Array.Empty<string>();
-            try
-            {
-                imgFiles = System.IO.Directory.GetFiles(folderPath, "*.img", SearchOption.TopDirectoryOnly);
-                binFiles = System.IO.Directory.GetFiles(folderPath, "*.bin", SearchOption.TopDirectoryOnly);
-            }
-            catch (Exception ex)
-            {
-                Log($"错误：扫描镜像文件失败 - {ex.Message}");
-                return;
-            }
-
-            var imageFiles = imgFiles.Concat(binFiles).ToList();
-            if (imageFiles.Count == 0)
-            {
-                Log("提示：未在所选目录中发现镜像文件（.img 或 .bin）");
-                return;
-            }
-
-            // 检测是否勾选“排除敏感文件”
-            bool excludeSensitive = false;
-            var genBtn = this.FindName("GenerateFlashScriptButton") as System.Windows.Controls.Button;
-            var parentGrid = genBtn?.Parent as System.Windows.Controls.Grid;
-            var sensitiveCb = parentGrid?.Children.OfType<System.Windows.Controls.CheckBox>()
-                .FirstOrDefault(cb => (cb.Content?.ToString() ?? string.Empty) == "排除敏感文件");
-            if (sensitiveCb?.IsChecked == true) excludeSensitive = true;
-
-            if (excludeSensitive)
-            {
-                var sensitiveNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { "persist", "ocdt", "fsc", "fsg", "modemst1", "modemst2", "persistbak" };
-                int before = imageFiles.Count;
-                imageFiles = imageFiles.Where(f => !sensitiveNames.Contains(System.IO.Path.GetFileNameWithoutExtension(f))).ToList();
-                int filtered = before - imageFiles.Count;
-                Log($"已排除敏感镜像 {filtered} 个");
-            }
-
-            Log($"检测到镜像 {imageFiles.Count} 个，开始生成脚本...");
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("@echo off");
-            sb.AppendLine("chcp 65001>nul");
-            sb.AppendLine("echo 请将手机重启到fastboot模式");
-            sb.AppendLine("echo 正在检测fastboot设备...");
-            sb.AppendLine(":wait_device");
-            sb.AppendLine("fastboot devices | findstr /R /C:\"^[0-9A-Za-z]\" >nul");
-            sb.AppendLine("if errorlevel 1 (");
-            sb.AppendLine("  echo 未检测到设备，3秒后重试...");
-            sb.AppendLine("  timeout /t 3 /nobreak >nul");
-            sb.AppendLine("  goto wait_device");
-            sb.AppendLine(")");
-            sb.AppendLine("echo 已检测到fastboot设备，开始刷入...");
-
-            foreach (var file in imageFiles)
-            {
-                string partition = System.IO.Path.GetFileNameWithoutExtension(file);
-                sb.AppendLine($"fastboot flash {partition} \"{file}\"");
-            }
-
-            sb.AppendLine("echo 所有分区刷入完成");
-            sb.AppendLine("echo 操作完成");
-            sb.AppendLine("pause");
-
-            string scriptPath = System.IO.Path.Combine(folderPath, "flash.bat");
-            try
-            {
-                System.IO.File.WriteAllText(scriptPath, sb.ToString(), System.Text.Encoding.UTF8);
-                Log($"脚本已生成：{scriptPath}");
-                System.Diagnostics.Process.Start("explorer.exe", folderPath);
-            }
-            catch (Exception ex)
-            {
-                Log($"错误：脚本生成失败 - {ex.Message}");
-            }
-        }
-
-        private void CheckBox_Checked_3(object sender, RoutedEventArgs e)
-        {
-        }
-
-        private void CheckBox_Checked_4(object sender, RoutedEventArgs e)
-        {
-        }
-
-        private void SelectUnpackedFolderButton_Click(object sender, RoutedEventArgs e)
-        {
-            var dialog = new System.Windows.Forms.FolderBrowserDialog
-            {
-                Description = "请选择解包好的文件夹",
-                ShowNewFolderButton = false
-            };
-
-            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-            {
-                var tb = FindName("UnpackedFolderTextBox") as System.Windows.Controls.TextBox;
-                if (tb != null)
-                {
-                    tb.Text = dialog.SelectedPath;
-                    tb.Foreground = System.Windows.Media.Brushes.Black;
-                }
-            }
-        }
-
-        private async void StartConvertFlashButton_Click(object sender, RoutedEventArgs e)
-        {
-            var tb = FindName("UnpackedFolderTextBox") as System.Windows.Controls.TextBox;
-            var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-            void Log(string m)
-            {
-                if (logBox != null)
-                {
-                    logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {m}\n");
-                    logBox.ScrollToEnd();
-                }
-            }
-
-            string dir = (tb?.Text ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(dir) || !System.IO.Directory.Exists(dir))
-            {
-                Log("错误：请选择有效的解包目录");
-                return;
-            }
-
-            var files = new List<string>();
-            try
-            {
-                files.AddRange(System.IO.Directory.GetFiles(dir, "*.img", SearchOption.TopDirectoryOnly));
-                files.AddRange(System.IO.Directory.GetFiles(dir, "*.bin", SearchOption.TopDirectoryOnly));
-            }
-            catch (Exception ex)
-            {
-                Log($"错误：扫描目录失败 - {ex.Message}");
-                return;
-            }
-
-            if (files.Count == 0)
-            {
-                Log("提示：目录中未发现镜像文件（.img 或 .bin）");
-                return;
-            }
-
-            string fastbootPath = GetFastbootPath();
-            Log("检测设备连接...");
-            if (!await CheckFastbootDevice())
-            {
-                Log("错误：未检测到fastboot设备");
-                return;
-            }
-            bool inFbd = await CheckFastbootdMode();
-
-            var superFile = files.FirstOrDefault(f => System.IO.Path.GetFileNameWithoutExtension(f).Equals("super", StringComparison.OrdinalIgnoreCase));
-            var modemFile = files.FirstOrDefault(f => System.IO.Path.GetFileNameWithoutExtension(f).Equals("modem", StringComparison.OrdinalIgnoreCase) || System.IO.Path.GetFileNameWithoutExtension(f).Equals("modem_ab", StringComparison.OrdinalIgnoreCase));
-
-            var fastbootList = new List<string>();
-            if (superFile != null) fastbootList.Add(superFile);
-            if (modemFile != null && !fastbootList.Contains(modemFile)) fastbootList.Add(modemFile);
-
-            var others = files.Where(f => !fastbootList.Contains(f)).ToList();
-
-            if (fastbootList.Count > 0)
-            {
-                if (inFbd)
-                {
-                    Log("重启到Fastboot模式...");
-                    await ExecuteFastbootCommandLive(fastbootPath, "reboot-bootloader", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                    for (int i = 0; i < 6; i++)
-                    {
-                        await Task.Delay(5000);
-                        if (await CheckFastbootDevice()) break;
-                    }
-                }
-                Log("在Fastboot模式刷写关键分区...");
-                foreach (var f in fastbootList)
-                {
-                    string part = System.IO.Path.GetFileNameWithoutExtension(f);
-                    Log($"fastboot flash {part} -> {f}");
-                    await ExecuteFastbootCommandLive(fastbootPath, $"flash {part} \"{f}\"", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                }
-            }
-
-            if (others.Count > 0)
-            {
-                Log("重启到FastbootD模式...");
-                if (!await RebootToFastbootd())
-                {
-                    Log("错误：无法进入FastbootD模式");
-                    return;
-                }
-                bool ok = false;
-                for (int i = 0; i < 6; i++)
-                {
-                    await Task.Delay(5000);
-                    if (await CheckFastbootdMode()) { ok = true; break; }
-                }
-                if (!ok)
-                {
-                    Log("错误：FastbootD模式检测失败");
-                    return;
-                }
-                Log("在FastbootD模式刷写其余分区...");
-                foreach (var f in others)
-                {
-                    string part = System.IO.Path.GetFileNameWithoutExtension(f);
-                    Log($"fastboot flash {part} -> {f}");
-                    await ExecuteFastbootCommandLive(fastbootPath, $"flash {part} \"{f}\"", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                }
-            }
-
-            var grid = (sender as System.Windows.Controls.Button)?.Parent as System.Windows.Controls.Grid;
-            bool needWipe = grid?.Children.OfType<System.Windows.Controls.CheckBox>().FirstOrDefault(cb => (cb.Content?.ToString() ?? string.Empty) == "清除数据")?.IsChecked == true;
-            bool needReboot = grid?.Children.OfType<System.Windows.Controls.CheckBox>().FirstOrDefault(cb => (cb.Content?.ToString() ?? string.Empty) == "自动重启")?.IsChecked == true;
-
-            if (needWipe)
-            {
-                Log("执行清除数据...");
-                await ExecuteFastbootCommandLive(fastbootPath, "reboot-bootloader", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                for (int i = 0; i < 6; i++) { await Task.Delay(3000); if (await CheckFastbootDevice()) break; }
-                await ExecuteFastbootCommandLive(fastbootPath, "erase frp", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                await ExecuteFastbootCommandLive(fastbootPath, "erase metadata", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                await ExecuteFastbootCommandLive(fastbootPath, "erase userdata", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                await ExecuteFastbootCommandLive(fastbootPath, "-w", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-                Log("清除数据完成");
-            }
-
-            if (needReboot)
-            {
-                Log("自动重启设备...");
-                await ExecuteFastbootCommandLive(fastbootPath, "reboot", s => { if (logBox != null) { logBox.AppendText(s + "\n"); logBox.ScrollToEnd(); } });
-            }
-
-            Log("刷写流程完成");
-        }
-
-        private async Task HandleReadPartitionTable()
-        {
-            try
-            {
-                string adbPath = GetToolPath("adb.exe");
-                string serial = GetSelectedDeviceSerial();
-                string args = string.IsNullOrWhiteSpace(serial)
-                    ? "shell ls -l /dev/block/by-name/"
-                    : $"-s {serial} shell ls -l /dev/block/by-name/";
-                string output = await GetCommandOutput(adbPath, args);
-                var names = new List<string>();
-                using (var reader = new StringReader(output))
-                {
-                    string? line;
-                    while ((line = reader.ReadLine()) != null)
-                    {
-                        int arrow = line.IndexOf("->");
-                        if (arrow > 0)
-                        {
-                            string left = line.Substring(0, arrow).TrimEnd();
-                            int lastSpace = left.LastIndexOf(' ');
-                            if (lastSpace >= 0 && lastSpace < left.Length - 1)
-                            {
-                                string name = left.Substring(lastSpace + 1).Trim();
-                                if (!string.IsNullOrWhiteSpace(name))
-                                    names.Add(name);
-                            }
-                        }
-                    }
-                }
-                names = names.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(n => n).ToList();
-                Dispatcher.Invoke(() =>
-                {
-                    var combo = FindName("ReadPartitionComboBox") as System.Windows.Controls.ComboBox;
-                    if (combo != null)
-                    {
-                        combo.ItemsSource = null;
-                        combo.Items.Clear();
-                        combo.ItemsSource = names;
-                        if (names.Count > 0)
-                        {
-                            combo.IsEditable = false;
-                            combo.IsReadOnly = false;
-                            combo.SelectedIndex = 0;
-                        }
-                        else
-                        {
-                            combo.IsEditable = true;
-                            combo.IsReadOnly = true;
-                            combo.Text = "未读取到分区";
-                        }
-                    }
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 已读取分区表，共 {names.Count} 项\n");
-                        logBox.ScrollToEnd();
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：{ex.Message}\n");
-                        logBox.ScrollToEnd();
-                    }
-                });
-            }
-        }
-
-        private async void ReadOutPartitionButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var combo = FindName("ReadPartitionComboBox") as System.Windows.Controls.ComboBox;
-                string name = combo?.SelectedItem as string;
-                if (string.IsNullOrWhiteSpace(name)) name = combo?.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(name) || name.Contains("读取分区表") || name.Contains("未读取到分区"))
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：未选择有效分区\n");
-                        logBox.ScrollToEnd();
-                    }
-                    return;
-                }
-                string defaultDir = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                var sfd = new Microsoft.Win32.SaveFileDialog
-                {
-                    Title = "选择保存路径",
-                    FileName = $"{name}.img",
-                    Filter = "镜像文件 (*.img)|*.img|所有文件 (*.*)|*.*",
-                    InitialDirectory = defaultDir
-                };
-                bool? dialogResult = sfd.ShowDialog();
-                if (dialogResult != true || string.IsNullOrWhiteSpace(sfd.FileName))
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 已取消保存\n");
-                        logBox.ScrollToEnd();
-                    }
-                    return;
-                }
-                string outPath = sfd.FileName;
-                string adbPath = GetToolPath("adb.exe");
-                string serial = GetSelectedDeviceSerial();
-                string args = string.IsNullOrWhiteSpace(serial)
-                    ? $"exec-out dd if=/dev/block/by-name/{name}"
-                    : $"-s {serial} exec-out dd if=/dev/block/by-name/{name}";
-                var start = new ProcessStartInfo
-                {
-                    FileName = adbPath,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                await Task.Run(() =>
-                {
-                    var p = new Process { StartInfo = start };
-                    using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                    {
-                        p.Start();
-                        p.StandardOutput.BaseStream.CopyTo(fs);
-                        p.WaitForExit();
-                    }
-                    string err = p.StandardError.ReadToEnd();
-                    if (!string.IsNullOrEmpty(err))
-                    {
-                        Dispatcher.Invoke(() =>
-                        {
-                            var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                            if (logBox != null)
-                            {
-                                logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 警告：{err}\n");
-                                logBox.ScrollToEnd();
-                            }
-                        });
-                    }
-                });
-                Dispatcher.Invoke(() =>
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 已提取 {name} 到: {outPath}\n");
-                        logBox.ScrollToEnd();
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：{ex.Message}\n");
-                        logBox.ScrollToEnd();
-                    }
-                });
-            }
-        }
-        private async Task ExecuteFastbootCommandLive(string fastbootPath, string arguments, Action<string> onLine)
-        {
-            try
-            {
-                await Task.Run(() =>
-                {
-                    string selectedSerial = GetSelectedDeviceSerial();
-                    string finalArguments = arguments;
-                    if (!string.IsNullOrEmpty(selectedSerial)) finalArguments = $"-s {selectedSerial} {arguments}";
-                    var p = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = fastbootPath,
-                            Arguments = finalArguments,
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            CreateNoWindow = true,
-                            StandardOutputEncoding = Encoding.UTF8,
-                            StandardErrorEncoding = Encoding.UTF8
-                        }
-                    };
-                    p.OutputDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) Dispatcher.Invoke(() => onLine(e.Data)); };
-                    p.ErrorDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) Dispatcher.Invoke(() => onLine(e.Data)); };
-                    p.Start();
-                    p.BeginOutputReadLine();
-                    p.BeginErrorReadLine();
-                    p.WaitForExit();
-                });
-            }
-            catch
-            {
-            }
-        }
-        
-        private async void ReadOutPartitionButton_Click_New(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var combo = FindName("ReadPartitionComboBox") as System.Windows.Controls.ComboBox;
-                string name = combo?.SelectedItem as string;
-                if (string.IsNullOrWhiteSpace(name)) name = combo?.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(name) || name.Contains("读取分区表") || name.Contains("未读取到分区"))
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：未选择有效分区\n");
-                        logBox.ScrollToEnd();
-                    }
-                    return;
-                }
-                string defaultDir = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                var sfd = new Microsoft.Win32.SaveFileDialog
-                {
-                    Title = "选择保存路径",
-                    FileName = $"{name}.img",
-                    Filter = "镜像文件 (*.img)|*.img|所有文件 (*.*)|*.*",
-                    InitialDirectory = defaultDir
-                };
-                bool? dialogResult = sfd.ShowDialog();
-                if (dialogResult != true || string.IsNullOrWhiteSpace(sfd.FileName))
-                {
-                    var logCancel = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logCancel != null)
-                    {
-                        logCancel.AppendText($"[{DateTime.Now:HH:mm:ss}] 已取消保存\n");
-                        logCancel.ScrollToEnd();
-                    }
-                    return;
-                }
-                string outPath = sfd.FileName;
-                string adbPath = GetToolPath("adb.exe");
-                string serial = GetSelectedDeviceSerial();
-                string devicePath = $"/sdcard/{name}_original.img";
-                string baseCmd = $"dd if=/dev/block/by-name/{name} of={devicePath} bs=4096 && sync";
-                string copyArgsSu = string.IsNullOrWhiteSpace(serial)
-                    ? $"shell su -c \"{baseCmd}\""
-                    : $"-s {serial} shell su -c \"{baseCmd}\"";
-                string copyArgsNoSu = string.IsNullOrWhiteSpace(serial)
-                    ? $"shell {baseCmd}"
-                    : $"-s {serial} shell {baseCmd}";
-                string noSuResultFirst = await GetCommandOutput(adbPath, copyArgsNoSu);
-                string lsCheck = await GetCommandOutput(adbPath, string.IsNullOrWhiteSpace(serial) ? $"shell ls -l {devicePath}" : $"-s {serial} shell ls -l {devicePath}");
-                if (string.IsNullOrWhiteSpace(lsCheck) || !lsCheck.Contains(name + "_original.img"))
-                {
-                    string suResult = await GetCommandOutput(adbPath, copyArgsSu);
-                    lsCheck = await GetCommandOutput(adbPath, string.IsNullOrWhiteSpace(serial) ? $"shell ls -l {devicePath}" : $"-s {serial} shell ls -l {devicePath}");
-                    if (string.IsNullOrWhiteSpace(lsCheck) || !lsCheck.Contains(name + "_original.img"))
-                    {
-                        var logFail = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                        if (logFail != null)
-                        {
-                            logFail.AppendText($"[{DateTime.Now:HH:mm:ss}] 设备端生成失败，尝试直流到电脑...\n");
-                            logFail.ScrollToEnd();
-                        }
-                        string execArgs = string.IsNullOrWhiteSpace(serial)
-                            ? $"exec-out dd if=/dev/block/by-name/{name} bs=4096"
-                            : $"-s {serial} exec-out dd if=/dev/block/by-name/{name} bs=4096";
-                        try
-                        {
-                            await Task.Run(() =>
-                            {
-                                var p = new Process
-                                {
-                                    StartInfo = new ProcessStartInfo
-                                    {
-                                        FileName = adbPath,
-                                        Arguments = execArgs,
-                                        UseShellExecute = false,
-                                        RedirectStandardOutput = true,
-                                        RedirectStandardError = true,
-                                        CreateNoWindow = true
-                                    }
-                                };
-                                using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                                {
-                                    p.Start();
-                                    p.StandardOutput.BaseStream.CopyTo(fs);
-                                    p.WaitForExit();
-                                }
-                                string err = p.StandardError.ReadToEnd();
-                                if (!string.IsNullOrEmpty(err))
-                                {
-                                    Dispatcher.Invoke(() =>
-                                    {
-                                        var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                                        if (logBox != null)
-                                        {
-                                            logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 警告：{err}\n");
-                                            logBox.ScrollToEnd();
-                                        }
-                                    });
-                                }
-                            });
-                            bool okStream = false;
-                            try
-                            {
-                                okStream = System.IO.File.Exists(outPath) && new System.IO.FileInfo(outPath).Length > 0;
-                            }
-                            catch { okStream = false; }
-                            if (!okStream)
-                            {
-                                Dispatcher.Invoke(() =>
-                                {
-                                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                                    if (logBox != null)
-                                    {
-                                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：直流失败，未生成文件\n");
-                                        logBox.ScrollToEnd();
-                                    }
-                                });
-                            }
-                            else
-                            {
-                                Dispatcher.Invoke(() =>
-                                {
-                                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                                    if (logBox != null)
-                                    {
-                                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 已提取 {name} 到: {outPath}\n");
-                                        logBox.ScrollToEnd();
-                                    }
-                                });
-                            }
-                        }
-                        catch (Exception ex2)
-                        {
-                            Dispatcher.Invoke(() =>
-                            {
-                                var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                                if (logBox != null)
-                                {
-                                    logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：直流异常：{ex2.Message}\n");
-                                    logBox.ScrollToEnd();
-                                }
-                            });
-                        }
-                        return;
-                    }
-                }
-                string pullArgs = string.IsNullOrWhiteSpace(serial)
-                    ? $"pull {devicePath} \"{outPath}\""
-                    : $"-s {serial} pull {devicePath} \"{outPath}\"";
-                string pullResult = await GetCommandOutput(adbPath, pullArgs);
-                bool ok = false;
-                try
-                {
-                    ok = System.IO.File.Exists(outPath) && new System.IO.FileInfo(outPath).Length > 0;
-                }
-                catch
-                {
-                    ok = false;
-                }
-                if (!ok)
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                        if (logBox != null)
-                        {
-                            logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：拉取失败，未生成文件。adb输出：{pullResult}\n");
-                            logBox.ScrollToEnd();
-                        }
-                    });
-                    return;
-                }
-                else
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                        if (logBox != null)
-                        {
-                            logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 已提取 {name} 到: {outPath}\n");
-                            logBox.ScrollToEnd();
-                        }
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    var logBox = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (logBox != null)
-                    {
-                        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：{ex.Message}\n");
-                        logBox.ScrollToEnd();
-                    }
-                });
-            }
-        }
-        
-        private async void WriteSelectedPartitionButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var combo = FindName("ReadPartitionComboBox") as System.Windows.Controls.ComboBox;
-                string? partition = combo?.SelectedItem as string;
-                if (string.IsNullOrWhiteSpace(partition)) partition = combo?.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(partition) || partition.Contains("读取分区表") || partition.Contains("未读取到分区"))
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：未选择有效分区\n");
-                        log.ScrollToEnd();
-                    }
-                    return;
-                }
-                var ofd = new Microsoft.Win32.OpenFileDialog
-                {
-                    Title = "选择要写入的镜像文件",
-                    Filter = "镜像文件 (*.img)|*.img|所有文件 (*.*)|*.*",
-                    Multiselect = false
-                };
-                bool? r = ofd.ShowDialog();
-                if (r != true || string.IsNullOrWhiteSpace(ofd.FileName) || !System.IO.File.Exists(ofd.FileName))
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 已取消或文件无效\n");
-                        log.ScrollToEnd();
-                    }
-                    return;
-                }
-                string localPath = ofd.FileName;
-                string fileName = System.IO.Path.GetFileName(localPath);
-                string remotePath = $"/tmp/{fileName}";
-                string adbPath = GetToolPath("adb.exe");
-                string serial = GetSelectedDeviceSerial();
-                string pushArgs = string.IsNullOrWhiteSpace(serial)
-                    ? $"push \"{localPath}\" \"/tmp/\""
-                    : $"-s {serial} push \"{localPath}\" \"/tmp/\"";
-                string pushResult = await GetCommandOutput(adbPath, pushArgs);
-                string checkTmp = await GetCommandOutput(adbPath, string.IsNullOrWhiteSpace(serial) ? $"shell ls -l {remotePath}" : $"-s {serial} shell ls -l {remotePath}");
-                if (string.IsNullOrWhiteSpace(checkTmp) || (!checkTmp.Contains(fileName)))
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：推送失败，adb输出：{pushResult}\n");
-                        log.ScrollToEnd();
-                    }
-                    return;
-                }
-                string ddCmd = $"dd if={remotePath} of=/dev/block/by-name/{partition} bs=4096 && sync";
-                string ddArgsNoSu = string.IsNullOrWhiteSpace(serial)
-                    ? $"shell {ddCmd}"
-                    : $"-s {serial} shell {ddCmd}";
-                string ddOutNoSu = await GetCommandOutput(adbPath, ddArgsNoSu);
-                bool needSu = false;
-                if (!string.IsNullOrEmpty(ddOutNoSu))
-                {
-                    string lower = ddOutNoSu.ToLowerInvariant();
-                    if (lower.Contains("permission denied") || lower.Contains("operation not permitted") || lower.Contains("read-only file system"))
-                    {
-                        needSu = true;
-                    }
-                }
-                else
-                {
-                    needSu = true;
-                }
-                if (needSu)
-                {
-                    string ddArgsSu = string.IsNullOrWhiteSpace(serial)
-                        ? $"shell su -c \"{ddCmd}\""
-                        : $"-s {serial} shell su -c \"{ddCmd}\"";
-                    string ddOutSu = await GetCommandOutput(adbPath, ddArgsSu);
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        if (string.IsNullOrWhiteSpace(ddOutSu) || ddOutSu.Contains("su: inaccessible", StringComparison.OrdinalIgnoreCase) || ddOutSu.Contains("not found", StringComparison.OrdinalIgnoreCase))
-                        {
-                            log.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：写入失败，su不可用或权限不足。非su输出：{ddOutNoSu} su输出：{ddOutSu}\n");
-                        }
-                        else
-                        {
-                            log.AppendText($"[{DateTime.Now:HH:mm:ss}] 写入完成\n");
-                        }
-                        log.ScrollToEnd();
-                    }
-                }
-                else
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 写入完成\n");
-                        log.ScrollToEnd();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                if (log != null)
-                {
-                    log.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：{ex.Message}\n");
-                    log.ScrollToEnd();
-                }
-            }
-        }
-        
-        private async void PushZipToSdcardButton_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var ofd = new Microsoft.Win32.OpenFileDialog
-                {
-                    Title = "选择要推送的卡刷包",
-                    Filter = "卡刷包 (*.zip)|*.zip|所有文件 (*.*)|*.*",
-                    Multiselect = false
-                };
-                bool? r = ofd.ShowDialog();
-                if (r != true || string.IsNullOrWhiteSpace(ofd.FileName) || !System.IO.File.Exists(ofd.FileName))
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 已取消或文件无效\n");
-                        log.ScrollToEnd();
-                    }
-                    return;
-                }
-                string localZip = ofd.FileName;
-                string adbPath = GetToolPath("adb.exe");
-                string devicesOut = await GetCommandOutput(adbPath, "devices");
-                bool hasRecovery = !string.IsNullOrWhiteSpace(devicesOut) && devicesOut.IndexOf("recovery", StringComparison.OrdinalIgnoreCase) >= 0;
-                if (!hasRecovery)
-                {
-                    var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                    if (log != null)
-                    {
-                        log.AppendText($"[{DateTime.Now:HH:mm:ss}] 未检测到 recovery 设备\n");
-                        log.ScrollToEnd();
-                    }
-                    return;
-                }
-                string serial = GetSelectedDeviceSerial();
-                string pushArgs = string.IsNullOrWhiteSpace(serial)
-                    ? $"push \"{localZip}\" \"/sdcard/\""
-                    : $"-s {serial} push \"{localZip}\" \"/sdcard/\"";
-                string pushOut = await GetCommandOutput(adbPath, pushArgs);
-                string fileName = System.IO.Path.GetFileName(localZip);
-                string lsOut = await GetCommandOutput(adbPath, string.IsNullOrWhiteSpace(serial) ? $"shell ls -l \"/sdcard/{fileName}\"" : $"-s {serial} shell ls -l \"/sdcard/{fileName}\"");
-                bool ok = !string.IsNullOrWhiteSpace(lsOut) && lsOut.IndexOf(fileName, StringComparison.OrdinalIgnoreCase) >= 0;
-                var logFinal = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                if (logFinal != null)
-                {
-                    if (ok)
-                    {
-                        logFinal.AppendText($"[{DateTime.Now:HH:mm:ss}] 已推送卡刷包到设备：/sdcard/{fileName}\n");
-                    }
-                    else
-                    {
-                        logFinal.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：推送失败。adb输出：{pushOut}\n");
-                    }
-                    logFinal.ScrollToEnd();
-                }
-            }
-            catch (Exception ex)
-            {
-                var log = FindName("SuperPackLogRichTextBox") as System.Windows.Controls.RichTextBox;
-                if (log != null)
-                {
-                    log.AppendText($"[{DateTime.Now:HH:mm:ss}] 错误：{ex.Message}\n");
-                    log.ScrollToEnd();
-                }
-            }
-        }
-        
-        private void PartitionSelectAllCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-            bool adbMode = IsFastbootVisualizationAdbMode();
-            foreach (var partition in allPartitions)
-            {
-                partition.IsSelected =
-                    !IsFastbootVisualizationPartitionProtected(partition.PartitionName, adbMode);
-            }
-            PartitionTableDataGrid.Items.Refresh();
-        }
-
-        private void PartitionSelectAllCheckBox_Unchecked(object sender, RoutedEventArgs e)
-        {
-            foreach (var partition in allPartitions)
-            {
-                partition.IsSelected = false;
-            }
-            PartitionTableDataGrid.Items.Refresh();
-        }
-
-        private bool IsFastbootVisualizationAdbMode()
-        {
-            return string.Equals(
-                BottomConnectionTypeText?.Text,
-                "系统",
-                StringComparison.OrdinalIgnoreCase);
-        }
-
-        private bool IsFastbootVisualizationPartitionProtected(string? partitionName, bool adbMode)
-        {
-            if (ProtectPartitionCheckBox?.IsChecked != true || string.IsNullOrWhiteSpace(partitionName))
-            {
-                return false;
-            }
-
-            if (IsFastbootVisualizationBasebandProtectedPartitionLabel(partitionName))
-            {
-                return true;
-            }
-
-            return adbMode && IsEdlDataPartitionLabel(partitionName);
-        }
-
-        internal static bool IsFastbootVisualizationBasebandProtectedPartitionLabel(string? partitionName)
-        {
-            if (string.IsNullOrWhiteSpace(partitionName))
-            {
-                return false;
-            }
-
-            string normalizedName = StripEdlSlotSuffix(partitionName.Trim());
-            return !normalizedName.Equals("persist", StringComparison.OrdinalIgnoreCase) &&
-                   IsEdlBasebandFingerprintBackupPartitionLabel(normalizedName);
-        }
-
-        private void ApplyFastbootVisualizationPartitionProtectionState(bool adbMode)
-        {
-            if (ProtectPartitionCheckBox?.IsChecked != true)
-            {
-                return;
-            }
-
-            foreach (PartitionInfo partition in allPartitions)
-            {
-                if (IsFastbootVisualizationPartitionProtected(partition.PartitionName, adbMode))
-                {
-                    partition.IsSelected = false;
-                }
-            }
-
-            PartitionTableDataGrid?.Items.Refresh();
-            UpdateSelectAllState();
-        }
-
-        private void ProtectPartitionCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-            ApplyFastbootVisualizationPartitionProtectionState(IsFastbootVisualizationAdbMode());
-        }
-
-        private void PartitionSelectionCheckBox_Click(object sender, RoutedEventArgs e)
-        {
-            if (sender is System.Windows.Controls.CheckBox checkBox &&
-                checkBox.DataContext is PartitionInfo partition &&
-                partition.IsSelected &&
-                IsFastbootVisualizationPartitionProtected(
-                    partition.PartitionName,
-                    IsFastbootVisualizationAdbMode()))
-            {
-                partition.IsSelected = false;
-                e.Handled = true;
-            }
-        }
-
-        private void SelectFlashBatButton_Click(object sender, RoutedEventArgs e)
-        {
-            Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog();
-            openFileDialog.Title = "选择刷写文件";
-            openFileDialog.Filter = "刷写文件 (*.bat;rawprogram*.xml)|*.bat;rawprogram*.xml|小米线刷脚本 (*.bat)|*.bat|RawProgram XML (rawprogram*.xml)|rawprogram*.xml";
-            openFileDialog.FilterIndex = 1;
-            openFileDialog.RestoreDirectory = true;
-            openFileDialog.Multiselect = true;
-
-            if (openFileDialog.ShowDialog() == true)
-            {
-                string[] selectedFiles = openFileDialog.FileNames;
-                bool containsBat = selectedFiles.Any(file =>
-                    Path.GetExtension(file).Equals(".bat", StringComparison.OrdinalIgnoreCase));
-                bool allRawPrograms = selectedFiles.All(file =>
-                    Path.GetExtension(file).Equals(".xml", StringComparison.OrdinalIgnoreCase) &&
-                    Path.GetFileName(file).StartsWith("rawprogram", StringComparison.OrdinalIgnoreCase));
-
-                if (containsBat)
-                {
-                    if (selectedFiles.Length != 1 ||
-                        !Path.GetExtension(selectedFiles[0]).Equals(".bat", StringComparison.OrdinalIgnoreCase))
-                    {
-                        LogToFastboot("小米线刷BAT只能单独选择一个，不能与RawProgram混选", "Yellow");
-                        return;
-                    }
-
-                    FlashBatTextBox.Text = selectedFiles[0];
-                    // 解析小米线刷脚本中的分区信息
-                    if (ParseXiaomiFlashScript(selectedFiles[0]))
-                    {
-                        UpdateXiaomiScriptOnlyOptionsState();
-                        LogToFastboot($"已选择小米线刷脚本：{selectedFiles[0]}", "Blue");
-                    }
-                }
-                else if (allRawPrograms)
-                {
-                    string displayText = string.Join("; ", selectedFiles);
-                    FlashBatTextBox.Text = displayText;
-                    LogToFastbootStyled(
-                        ("用户已选择RawProgram文件，共", "Black", false),
-                        ($"{selectedFiles.Length}", "Purple", true),
-                        ("个", "Black", false));
-                    ParseRawProgramXmlFiles(selectedFiles, displayText);
-                }
-                else
-                {
-                    LogToFastboot("请选择一个BAT，或同时选择一个或多个rawprogram*.xml", "Yellow");
-                }
-            }
-        }
-
-        private void FlashBatTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            UpdateXiaomiScriptOnlyOptionsState();
-        }
-
-        private void FlashBatTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        {
-            const string placeholderText = "flash_all*.bat 或 rawprogram*.xml";
-            if (sender is System.Windows.Controls.TextBox textBox &&
-                string.Equals(textBox.Text, placeholderText, StringComparison.Ordinal))
-            {
-                textBox.Clear();
-            }
-        }
-
-        private bool ParseRawProgramXmlFiles(IReadOnlyCollection<string> xmlPaths, string displayText)
-        {
-            try
-            {
-                DeactivateXiaomiScriptMode();
-                var parsedPartitions = new List<PartitionInfo>();
-                var unsupportedSegmentedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                int skippedGptCount = 0;
-                int skippedInvalidCount = 0;
-
-                foreach (string xmlPath in xmlPaths
-                             .Select(Path.GetFullPath)
-                             .Distinct(StringComparer.OrdinalIgnoreCase)
-                             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
-                {
-                    var document = System.Xml.Linq.XDocument.Load(xmlPath);
-                    string xmlDirectory = Path.GetDirectoryName(xmlPath) ?? string.Empty;
-                    int loadedFileCount = 0;
-                    var programElements = document
-                        .Descendants()
-                        .Where(element => element.Name.LocalName.Equals("program", StringComparison.OrdinalIgnoreCase));
-
-                    foreach (var program in programElements)
-                    {
-                        string label = ((string?)program.Attribute("label") ?? string.Empty).Trim();
-                        string fileName = ((string?)program.Attribute("filename") ?? string.Empty).Trim().Trim('"');
-                        string fileSectorOffset = ((string?)program.Attribute("file_sector_offset") ?? "0").Trim();
-                        if (IsRawProgramGptEntry(label, fileName))
-                        {
-                            skippedGptCount++;
-                            continue;
-                        }
-
-                        if (string.IsNullOrWhiteSpace(label) || string.IsNullOrWhiteSpace(fileName))
-                        {
-                            skippedInvalidCount++;
-                            continue;
-                        }
-
-                        if (unsupportedSegmentedLabels.Contains(label) ||
-                            !ulong.TryParse(fileSectorOffset, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong parsedFileSectorOffset) ||
-                            parsedFileSectorOffset != 0)
-                        {
-                            unsupportedSegmentedLabels.Add(label);
-                            parsedPartitions.RemoveAll(partition =>
-                                partition.PartitionName.Equals(label, StringComparison.OrdinalIgnoreCase));
-                            skippedInvalidCount++;
-                            continue;
-                        }
-
-                        string imagePath = Path.IsPathFullyQualified(fileName)
-                            ? fileName
-                            : Path.GetFullPath(Path.Combine(xmlDirectory, fileName.Replace('/', Path.DirectorySeparatorChar)));
-                        if (!File.Exists(imagePath))
-                        {
-                            unsupportedSegmentedLabels.Add(label);
-                            skippedInvalidCount++;
-                            continue;
-                        }
-
-                        if (parsedPartitions.Any(partition =>
-                                partition.PartitionName.Equals(label, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            unsupportedSegmentedLabels.Add(label);
-                            skippedInvalidCount++;
-                            LogToFastboot($"RawProgram分区包含多个物理片段，已跳过：{label}", "Yellow");
-                            parsedPartitions.RemoveAll(partition =>
-                                partition.PartitionName.Equals(label, StringComparison.OrdinalIgnoreCase));
-                            continue;
-                        }
-
-                        parsedPartitions.Add(new PartitionInfo
-                        {
-                            PartitionName = label,
-                            PartitionSize = FormatFileSize(new FileInfo(imagePath).Length),
-                            PartitionType = "RawProgram分区",
-                            FilePath = imagePath,
-                            IsSelected = true
-                        });
-                        loadedFileCount++;
-                    }
-
-                    LogToFastbootStyled(
-                        ($"已加载{Path.GetFileName(xmlPath)}，共", "Black", false),
-                        ($"{loadedFileCount}", "Purple", true),
-                        ("个文件", "Black", false));
-                }
-
-                allPartitions.Clear();
-                foreach (PartitionInfo partition in parsedPartitions)
-                {
-                    allPartitions.Add(partition);
-                }
-                PartitionTableDataGrid.ItemsSource = allPartitions;
-                PartitionTableDataGrid.Items.Refresh();
-                ApplyFastbootVisualizationPartitionProtectionState(IsFastbootVisualizationAdbMode());
-                UpdateSelectAllState();
-
-                if (parsedPartitions.Count == 0)
-                {
-                    LogToFastboot("所选RawProgram中没有可用于分区刷写的完整镜像条目", "Red");
-                    return false;
-                }
-
-                _parsedRawProgramPaths = xmlPaths
-                    .Select(Path.GetFullPath)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-                _parsedRawProgramDisplayText = displayText;
-                UpdateXiaomiScriptOnlyOptionsState();
-
-                bool adbMode = IsFastbootVisualizationAdbMode();
-                bool protectionEnabled = ProtectPartitionCheckBox?.IsChecked == true;
-                int skippedDataPartitionCount = protectionEnabled && adbMode
-                    ? parsedPartitions.Count(partition => IsEdlDataPartitionLabel(partition.PartitionName))
-                    : 0;
-                int skippedBasebandPartitionCount = protectionEnabled
-                    ? parsedPartitions.Count(partition =>
-                        IsFastbootVisualizationBasebandProtectedPartitionLabel(partition.PartitionName))
-                    : 0;
-
-                var skippedCategories = new List<(int Count, string Label)>();
-                if (skippedGptCount > 0)
-                {
-                    skippedCategories.Add((skippedGptCount, "个GPT物理条目"));
-                }
-                if (skippedDataPartitionCount > 0)
-                {
-                    skippedCategories.Add((skippedDataPartitionCount, "个数据分区"));
-                }
-                if (skippedBasebandPartitionCount > 0)
-                {
-                    skippedCategories.Add((skippedBasebandPartitionCount, "个基带相关分区"));
-                }
-
-                var summarySegments = new List<(string Text, string Color, bool Emphasized)>
-                {
-                    ("本次刷写分区数共", "Black", false),
-                    ($"{parsedPartitions.Count}", "Purple", true),
-                    ("个", "Black", false)
-                };
-                if (skippedCategories.Count > 0)
-                {
-                    summarySegments.Add(("，本次刷写将跳过", "Black", false));
-                    for (int index = 0; index < skippedCategories.Count; index++)
-                    {
-                        if (index > 0)
-                        {
-                            summarySegments.Add((
-                                index == skippedCategories.Count - 1 ? "和" : "、",
-                                "Black",
-                                false));
-                        }
-
-                        summarySegments.Add(($"{skippedCategories[index].Count}", "Purple", true));
-                        summarySegments.Add((skippedCategories[index].Label, "Black", false));
-                    }
-                }
-                summarySegments.Add(("。", "Black", false));
-                LogToFastbootStyled(summarySegments.ToArray());
-
-                if (adbMode && (skippedDataPartitionCount > 0 || skippedBasebandPartitionCount > 0))
-                {
-                    LogToFastboot(
-                        "开机模式下写入数据分区和基带相关分区可能导致数据丢失或设备无限重启；如有相关需求，请将设备重启到Fastboot模式下刷写相关分区",
-                        "Yellow");
-                }
-                return true;
-            }
-            catch (Exception ex)
-            {
-                DeactivateXiaomiScriptMode();
-                allPartitions.Clear();
-                PartitionTableDataGrid?.Items.Refresh();
-                LogToFastboot($"RawProgram解析失败：{ex.Message}", "Red");
-                return false;
-            }
-        }
-
-        private static bool IsRawProgramGptEntry(string label, string fileName)
-        {
-            string normalizedLabel = label.Trim();
-            string normalizedFile = Path.GetFileName(fileName.Trim());
-            return normalizedLabel.Equals("PrimaryGPT", StringComparison.OrdinalIgnoreCase) ||
-                   normalizedLabel.Equals("BackupGPT", StringComparison.OrdinalIgnoreCase) ||
-                   normalizedLabel.Equals("GPT", StringComparison.OrdinalIgnoreCase) ||
-                   normalizedFile.StartsWith("gpt_main", StringComparison.OrdinalIgnoreCase) ||
-                   normalizedFile.StartsWith("gpt_backup", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private void SkipCrcCheckBox_Changed(object sender, RoutedEventArgs e)
-        {
-            ApplySkipCrcSelectionState();
-        }
-
-        private void ApplySkipCrcSelectionState()
-        {
-            if (!HasActiveParsedXiaomiScript() || SkipCrcCheckBox == null || allPartitions == null)
-            {
-                return;
-            }
-
-            bool selectCrcPartitions = SkipCrcCheckBox.IsChecked != true;
-            foreach (PartitionInfo partition in allPartitions.Where(partition =>
-                         IsCrcListPartition(partition.PartitionName)))
-            {
-                partition.IsSelected = selectCrcPartitions;
-            }
-
-            PartitionTableDataGrid?.Items.Refresh();
-            UpdateSelectAllState();
-        }
-
-        private void UpdateXiaomiScriptOnlyOptionsState()
-        {
-            bool hasParsedScript = HasActiveParsedXiaomiScript();
-            bool hasRawProgramInFastboot = HasActiveParsedRawProgram() &&
-                                           string.Equals(
-                                               BottomConnectionTypeText?.Text,
-                                               "Fastboot",
-                                               StringComparison.OrdinalIgnoreCase);
-
-            SetFlashOptionState(SwitchSlotACheckBox, hasParsedScript || hasRawProgramInFastboot, false);
-            SetFlashOptionState(KeepUserDataCheckBox, hasParsedScript || hasRawProgramInFastboot, false);
-            SetFlashOptionState(LockBootloaderCheckBox, hasParsedScript, false);
-            SetFlashOptionState(DisableDmVerityCheckBox, hasParsedScript, false);
-            SetFlashOptionState(SkipCrcCheckBox, hasParsedScript, true);
-
-            if (hasParsedScript)
-            {
-                ApplySkipCrcSelectionState();
-            }
-        }
-
-        private static void SetFlashOptionState(
-            System.Windows.Controls.CheckBox? option,
-            bool isEnabled,
-            bool disabledCheckedState)
-        {
-            if (option == null)
-            {
-                return;
-            }
-
-            option.IsEnabled = isEnabled;
-            if (!isEnabled)
-            {
-                option.IsChecked = disabledCheckedState;
-            }
-        }
-
-        private bool HasActiveParsedXiaomiScript()
-        {
-            try
-            {
-                string currentPath = FlashBatTextBox?.Text?.Trim() ?? string.Empty;
-                return _parsedXiaomiFlashScriptLines != null &&
-                       Path.IsPathFullyQualified(currentPath) &&
-                       File.Exists(currentPath) &&
-                       string.Equals(Path.GetExtension(currentPath), ".bat", StringComparison.OrdinalIgnoreCase) &&
-                       string.Equals(
-                           _parsedXiaomiFlashScriptPath,
-                           Path.GetFullPath(currentPath),
-                           StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private bool HasActiveParsedRawProgram()
-        {
-            try
-            {
-                string currentPath = FlashBatTextBox?.Text?.Trim() ?? string.Empty;
-                return _parsedRawProgramPaths.Count > 0 &&
-                       _parsedRawProgramPaths.All(path =>
-                           File.Exists(path) &&
-                           Path.GetFileName(path).StartsWith("rawprogram", StringComparison.OrdinalIgnoreCase)) &&
-                       string.Equals(
-                           _parsedRawProgramDisplayText,
-                           currentPath,
-                           StringComparison.Ordinal);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private void DeactivateXiaomiScriptMode()
-        {
-            _parsedXiaomiFlashScriptPath = null;
-            _parsedXiaomiFlashScriptLines = null;
-            _parsedRawProgramPaths = Array.Empty<string>();
-            _parsedRawProgramDisplayText = null;
-            UpdateXiaomiScriptOnlyOptionsState();
-        }
-
-        private bool ParseXiaomiFlashScript(string scriptPath)
-        {
-            try
-            {
-                _parsedXiaomiFlashScriptPath = null;
-                _parsedXiaomiFlashScriptLines = null;
-                _parsedRawProgramPaths = Array.Empty<string>();
-                _parsedRawProgramDisplayText = null;
-
-                // 清空现有分区列表
-                allPartitions.Clear();
-                
-                // 读取脚本文件内容
-                string[] lines = System.IO.File.ReadAllLines(scriptPath);
-                
-                foreach (string line in lines)
-                {
-                    // 查找fastboot flash命令行
-                    if (line.Trim().StartsWith("fastboot") && line.Contains("flash"))
-                    {
-                        // 解析fastboot flash命令
-                        string[] parts = line.Trim().Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                        
-                        // 找到flash关键字的位置
-                        int flashIndex = -1;
-                        for (int i = 0; i < parts.Length; i++)
-                        {
-                            if (parts[i] == "flash")
-                            {
-                                flashIndex = i;
-                                break;
-                            }
-                        }
-                        
-                        // 如果找到flash关键字且后面有分区名称
-                        if (flashIndex >= 0 && flashIndex + 1 < parts.Length)
-                        {
-                            string partitionName = parts[flashIndex + 1];
-                            
-                            // 获取镜像文件路径（如果存在）
-                            string imagePath = "";
-                            if (flashIndex + 2 < parts.Length)
-                            {
-                                imagePath = parts[flashIndex + 2];
-                                // 移除可能的路径前缀
-                                if (imagePath.Contains("%~dp0images/"))
-                                {
-                                    imagePath = imagePath.Replace("%~dp0images/", "");
-                                }
-                                else if (imagePath.Contains("%~dp0images\\"))
-                                {
-                                    imagePath = imagePath.Replace("%~dp0images\\", "");
-                                }
-                            }
-                            
-                            // 检查是否为 modem_ab 分区，如果是则分解为 modem_a 和 modem_b 两个分区
-                            if (partitionName.Equals("modem_ab", StringComparison.OrdinalIgnoreCase))
-                            {
-                                // 创建 modem_a 分区
-                                PartitionInfo partitionA = new PartitionInfo
-                                {
-                                    PartitionName = "modem_a",
-                                    PartitionSize = "未知",
-                                    PartitionType = "Flash分区",
-                                    FilePath = imagePath,
-                                    IsSelected = false
-                                };
-                                
-                                // 创建 modem_b 分区
-                                PartitionInfo partitionB = new PartitionInfo
-                                {
-                                    PartitionName = "modem_b",
-                                    PartitionSize = "未知",
-                                    PartitionType = "Flash分区",
-                                    FilePath = imagePath,
-                                    IsSelected = false
-                                };
-                                
-                                // 检查是否已存在相同名称的分区（避免重复）
-                                bool existsA = false, existsB = false;
-                                foreach (var existingPartition in allPartitions)
-                                {
-                                    if (existingPartition.PartitionName.Equals("modem_a", StringComparison.OrdinalIgnoreCase))
-                                        existsA = true;
-                                    if (existingPartition.PartitionName.Equals("modem_b", StringComparison.OrdinalIgnoreCase))
-                                        existsB = true;
-                                }
-                                
-                                if (!existsA)
-                                {
-                                    allPartitions.Add(partitionA);
-                                }
-                                if (!existsB)
-                                {
-                                    allPartitions.Add(partitionB);
-                                }
-                            }
-                            else
-                            {
-                                // 普通分区处理
-                                PartitionInfo partition = new PartitionInfo
-                                {
-                                    PartitionName = partitionName,
-                                    PartitionSize = "未知", // 脚本中通常不包含大小信息
-                                    PartitionType = "Flash分区",
-                                    FilePath = imagePath,
-                                    IsSelected = false
-                                };
-                                
-                                // 检查是否已存在相同名称的分区（避免重复）
-                                bool exists = false;
-                                foreach (var existingPartition in allPartitions)
-                                {
-                                    if (existingPartition.PartitionName == partitionName)
-                                    {
-                                        exists = true;
-                                        break;
-                                    }
-                                }
-                                
-                                if (!exists)
-                                {
-                                    allPartitions.Add(partition);
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // 解析分区文件的实际存放路径
-                string scriptDirectory = Path.GetDirectoryName(scriptPath) ?? "";
-                if (string.IsNullOrEmpty(scriptDirectory))
-                {
-                    throw new InvalidOperationException("无法解析脚本目录");
-                }
-                string imagesDirectory = Path.Combine(scriptDirectory, "images");
-                
-                foreach (var partition in allPartitions)
-                {
-                    if (!string.IsNullOrEmpty(partition.FilePath))
-                    {
-                        // 构建完整的文件路径
-                        string fullImagePath = Path.Combine(imagesDirectory, partition.FilePath);
-                        
-                        // 检查文件是否存在并更新路径
-                        if (File.Exists(fullImagePath))
-                        {
-                            partition.FilePath = fullImagePath;
-                            
-                            // 尝试获取文件大小
-                            try
-                            {
-                                FileInfo fileInfo = new FileInfo(fullImagePath);
-                                long fileSizeBytes = fileInfo.Length;
-                                
-                                // 转换为可读的文件大小格式
-                                string fileSize;
-                                if (fileSizeBytes >= 1024 * 1024 * 1024)
-                                {
-                                    fileSize = $"{fileSizeBytes / (1024.0 * 1024.0 * 1024.0):F2} GB";
-                                }
-                                else if (fileSizeBytes >= 1024 * 1024)
-                                {
-                                    fileSize = $"{fileSizeBytes / (1024.0 * 1024.0):F2} MB";
-                                }
-                                else if (fileSizeBytes >= 1024)
-                                {
-                                    fileSize = $"{fileSizeBytes / 1024.0:F2} KB";
-                                }
-                                else
-                                {
-                                    fileSize = $"{fileSizeBytes} B";
-                                }
-                                
-                                partition.PartitionSize = fileSize;
-                            }
-                            catch
-                            {
-                                partition.PartitionSize = "无法获取";
-                            }
-                        }
-                        else
-                        {
-                            // 文件不存在，标记为缺失
-                            partition.PartitionSize = "文件缺失";
-                            partition.FilePath = fullImagePath + " (缺失)";
-                        }
-                    }
-                }
-                
-                // 刷新数据网格显示
-                PartitionTableDataGrid.Items.Refresh();
-                
-                // 自动勾选所有分区
-                foreach (var partition in allPartitions)
-                {
-                    partition.IsSelected = true;
-                }
-                ApplyFastbootVisualizationPartitionProtectionState(adbMode: false);
-                 
-                // 根据脚本内容和文件名自动勾选相应的复选框
-                AutoSelectCheckBoxes(scriptPath, lines);
-                _parsedXiaomiFlashScriptPath = Path.GetFullPath(scriptPath);
-                _parsedXiaomiFlashScriptLines = lines;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                System.Windows.MessageBox.Show($"解析小米线刷脚本时出错：{ex.Message}", "解析错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                return false;
-            }
-        }
-
-        private void AutoSelectCheckBoxes(string scriptPath, string[] lines)
-        {
-            try
-            {
-                // 始终自动勾选"自动重启"复选框
-                RestartCheckBox.IsChecked = true;
-                
-                // 获取脚本文件名
-                string scriptFileName = Path.GetFileName(scriptPath);
-                
-                // 如果脚本名为flash_all.bat，自动勾选"清除数据"
-                if (string.Equals(scriptFileName, "flash_all.bat", StringComparison.OrdinalIgnoreCase))
-                {
-                    KeepUserDataCheckBox.IsChecked = true;
-                }
-                
-                // 检查脚本内容
-                string scriptContent = string.Join(" ", lines).ToLower();
-                
-                // 如果脚本中有"set_active a"字样，自动勾选"切换A槽"
-                if (scriptContent.Contains("set_active a"))
-                {
-                    SwitchSlotACheckBox.IsChecked = true;
-                }
-                
-                // 如果脚本中有"oem lock"字样，自动勾选"锁定BL"和"清除数据"
-                if (scriptContent.Contains("oem lock"))
-                {
-                    LockBootloaderCheckBox.IsChecked = true;
-                    KeepUserDataCheckBox.IsChecked = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                // 如果自动勾选过程中出现错误，记录但不影响主流程
-                System.Diagnostics.Debug.WriteLine($"自动勾选复选框时出错：{ex.Message}");
-            }
-        }
-
-        private async Task<bool> ExecuteXiaomiFlashScript(
-            string scriptFilePath,
-            System.Windows.Controls.RichTextBox logTextBox,
-            IReadOnlyCollection<PartitionInfo> availablePartitions,
-            XiaomiFlashMode flashMode,
-            CancellationToken cancellationToken)
-        {
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!File.Exists(scriptFilePath))
-                {
-                    logTextBox.AppendText("[Error] 所选小米线刷脚本不存在\n");
-                    logTextBox.ScrollToEnd();
-                    return false;
-                }
-
-                string? scriptPath = Path.GetDirectoryName(scriptFilePath);
-                if (string.IsNullOrWhiteSpace(scriptPath))
-                {
-                    LogToFastboot("无法确定脚本所在目录", "Red");
-                    return false;
-                }
-
-                string normalizedScriptPath = Path.GetFullPath(scriptFilePath);
-                if (_parsedXiaomiFlashScriptLines == null ||
-                    !string.Equals(_parsedXiaomiFlashScriptPath, normalizedScriptPath, StringComparison.OrdinalIgnoreCase))
-                {
-                    LogToFastboot("脚本尚未解析或已发生变化，请重新选择 BAT 脚本", "Red");
-                    return false;
-                }
-                
-                // 直接执行选择脚本时已经解析并缓存的命令，不在点击写入后重复解析。
-                return await ParseAndExecuteFastbootCommands(
-                    _parsedXiaomiFlashScriptLines,
-                    scriptPath,
-                    logTextBox,
-                    availablePartitions,
-                    flashMode,
-                    cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                logTextBox.AppendText($"[Error] 执行小米线刷脚本失败: {ex.Message}\n");
-                logTextBox.ScrollToEnd();
-                return false;
-            }
-        }
-        
-        private async Task<bool> ParseAndExecuteFastbootCommands(
-            string[] lines,
-            string scriptPath,
-            System.Windows.Controls.RichTextBox logTextBox,
-            IReadOnlyCollection<PartitionInfo> availablePartitions,
-            XiaomiFlashMode flashMode,
-            CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            string fastbootPath = GetToolPath("fastboot.exe");
-            if (string.IsNullOrEmpty(fastbootPath))
-            {
-                LogToFastboot("缺少 fastboot.exe，无法执行刷写", "Red");
-                return false;
-            }
-            
-            string imagesPath = Path.Combine(scriptPath, "images");
-            if (!Directory.Exists(imagesPath))
-            {
-                LogToFastboot("脚本目录中未找到 images 文件夹", "Red");
-                return false;
-            }
-
-            // 写入分区按钮必须至少有一条仍被用户选中的 flash 任务。
-            // 先做此检查，防止所有分区都取消后仍执行脚本中的 erase/oem 等命令。
-            bool hasSelectedFlashCommand = lines.Any(line =>
-            {
-                Match match = Regex.Match(line, @"\bflash\s+([^\s""']+)", RegexOptions.IgnoreCase);
-                return match.Success &&
-                       FindPartitionSelectionForScript(match.Groups[1].Value.Trim(), availablePartitions)?.IsSelected == true;
-            });
-            if (!hasSelectedFlashCommand)
-            {
-                LogToFastboot("没有选中可执行的脚本刷写任务", "Red");
-                return false;
-            }
-
-            Stopwatch partitionWriteStopwatch = Stopwatch.StartNew();
-            bool foundFlashCommand = false;
-            bool allFlashCommandsSucceeded = true;
-            bool allAdditionalCommandsSucceeded = true;
-            int failedPartitionCount = 0;
-            int executedFlashCommandCount = 0;
-            bool? shouldFlashCrcPartitions = null;
-            foreach (string line in lines)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                string trimmedLine = line.Trim();
-                
-                // 跳过注释和空行
-                if (string.IsNullOrEmpty(trimmedLine) || trimmedLine.StartsWith("::") || trimmedLine.StartsWith("@echo"))
-                    continue;
-                
-                // 按 BAT 顺序执行 erase、flash 和允许的 OEM 命令。
-                // metadata/userdata、切槽、锁BL和重启仍由页面复选框统一控制，避免脚本绕过用户选择。
-                if (trimmedLine.StartsWith("fastboot", StringComparison.OrdinalIgnoreCase))
-                {
-                    Match eraseMatch = Regex.Match(trimmedLine, @"\berase\s+([^\s""']+)", RegexOptions.IgnoreCase);
-                    if (eraseMatch.Success)
-                    {
-                        string erasePartition = eraseMatch.Groups[1].Value.Trim();
-                        // metadata/userdata 属于页面“清除数据”选项，避免脚本与后置逻辑重复执行。
-                        if (erasePartition.Equals("metadata", StringComparison.OrdinalIgnoreCase) ||
-                            erasePartition.Equals("userdata", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
-
-                        PartitionInfo? erasePartitionInfo = FindPartitionSelectionForScript(erasePartition, availablePartitions);
-                        if (erasePartitionInfo != null && !erasePartitionInfo.IsSelected)
-                        {
-                            continue;
-                        }
-
-                        string eraseTarget = GetXiaomiFlashTargetPartition(erasePartition, flashMode);
-                        LogFastbootEraseBegin(eraseTarget);
-                        bool eraseSucceeded = await ExecuteSingleFastbootCommand(
-                            fastbootPath,
-                            $"erase {eraseTarget}",
-                            logTextBox,
-                            cancellationToken: CancellationToken.None);
-                        if (eraseSucceeded)
-                        {
-                            LogFastbootEraseEndOk(eraseTarget);
-                        }
-                        else
-                        {
-                            allAdditionalCommandsSucceeded = false;
-                            LogFastbootEraseEndFail(eraseTarget);
-                        }
-                        continue;
-                    }
-
-                    Match oemMatch = Regex.Match(trimmedLine, @"\boem\s+([^\s|&]+)", RegexOptions.IgnoreCase);
-                    if (oemMatch.Success && oemMatch.Groups[1].Value.Equals("cdms", StringComparison.OrdinalIgnoreCase))
-                    {
-                        LogToFastboot("[OEM] 执行 cdms...", "Black");
-                        if (!await ExecuteSingleFastbootCommand(
-                                fastbootPath,
-                                "oem cdms",
-                                logTextBox,
-                                cancellationToken: CancellationToken.None))
-                        {
-                            allAdditionalCommandsSucceeded = false;
-                            LogToFastboot("OEM cdms 执行失败", "Red");
-                        }
-                        else
-                        {
-                            LogToFastboot("[OEM] cdms...OK", "Green");
-                        }
-                        continue;
-                    }
-
-                    Match flashMatch = Regex.Match(trimmedLine, @"\bflash\s+([^\s""']+)", RegexOptions.IgnoreCase);
-                    if (!flashMatch.Success)
-                    {
-                        continue;
-                    }
-
-                    string partitionName = flashMatch.Groups[1].Value.Trim();
-                    PartitionInfo? matchingPartition = FindPartitionSelectionForScript(partitionName, availablePartitions);
-                    if (matchingPartition?.IsSelected != true)
-                    {
-                        continue;
-                    }
-
-                    foundFlashCommand = true;
-                    if (IsCrcListPartition(partitionName))
-                    {
-                        if (!shouldFlashCrcPartitions.HasValue)
-                        {
-                            if (SkipCrcCheckBox?.IsChecked == true)
-                            {
-                                shouldFlashCrcPartitions = false;
-                                LogToFastboot("已按选项跳过 CRC 分区：crclist、sparsecrclist", "Black");
-                            }
-                            else
-                            {
-                                shouldFlashCrcPartitions = await DeviceRequiresCrcPartitionsAsync(
-                                    fastbootPath,
-                                    cancellationToken);
-                                if (shouldFlashCrcPartitions != true)
-                                {
-                                    LogToFastboot("设备未返回 crc: 1，已跳过 crclist、sparsecrclist", "Black");
-                                }
-                            }
-                        }
-
-                        if (shouldFlashCrcPartitions != true)
-                        {
-                            continue;
-                        }
-                    }
-
-                    string? sourceFileName = Path.GetFileName(matchingPartition.FilePath);
-                    string targetPartitionName = GetXiaomiFlashTargetPartition(partitionName, flashMode);
-                    string effectiveCommandLine = ReplaceFastbootPartitionArgument(
-                        trimmedLine,
-                        "flash",
-                        targetPartitionName);
-                    executedFlashCommandCount++;
-                    LogFastbootWriteBegin(sourceFileName, targetPartitionName);
-                    bool commandSucceeded = await ExecuteFastbootCommandFromScript(
-                        effectiveCommandLine,
-                        scriptPath,
-                        fastbootPath,
-                        logTextBox,
-                        targetPartitionName,
-                        sourceFileName,
-                        CancellationToken.None);
-                    if (!commandSucceeded)
-                    {
-                        allFlashCommandsSucceeded = false;
-                        failedPartitionCount++;
-                        LogFastbootWriteEndFail(targetPartitionName, sourceFileName);
-                    }
-                    else
-                    {
-                        LogFastbootWriteEndOk(targetPartitionName, sourceFileName);
-                    }
-                }
-            }
-
-            partitionWriteStopwatch.Stop();
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!foundFlashCommand)
-            {
-                LogToFastboot("所选脚本中未找到可执行的 fastboot flash 命令", "Red");
-                return false;
-            }
-
-            if (executedFlashCommandCount == 0)
-            {
-                LogToFastboot("所选分区均已按条件跳过，没有执行刷写；后置操作已取消", "Yellow");
-                return false;
-            }
-
-            long elapsedSeconds = Math.Max(0, (long)Math.Ceiling(partitionWriteStopwatch.Elapsed.TotalSeconds));
-            LogToFastboot(
-                $"写入完成，写入失败分区{failedPartitionCount}个，耗时{elapsedSeconds}秒",
-                allFlashCommandsSucceeded ? "Green" : "Orange");
-            
-            // 按照优先级顺序执行复选框对应的命令：清除数据 -> 切换A槽 -> 锁定BL -> 自动重启
-            if (!allFlashCommandsSucceeded)
-            {
-                LogToFastboot("脚本存在刷写失败项，锁BL操作将被强制跳过", "Yellow");
-            }
-
-            bool postActionsSucceeded = await ExecutePostFlashCommands(
-                fastbootPath,
-                logTextBox,
-                allowBootloaderLock: allFlashCommandsSucceeded && allAdditionalCommandsSucceeded,
-                forceSwitchSlotA: flashMode == XiaomiFlashMode.SlotA,
-                cancellationToken: cancellationToken);
-            return allFlashCommandsSucceeded && allAdditionalCommandsSucceeded && postActionsSucceeded;
-        }
-
-        private static string GetXiaomiFlashTargetPartition(
-            string partitionName,
-            XiaomiFlashMode flashMode)
-        {
-            if (flashMode == XiaomiFlashMode.SlotA &&
-                partitionName.EndsWith("_ab", StringComparison.OrdinalIgnoreCase))
-            {
-                return partitionName.Substring(0, partitionName.Length - 3) + "_a";
-            }
-
-            return partitionName;
-        }
-
-        private static string ReplaceFastbootPartitionArgument(
-            string commandLine,
-            string command,
-            string targetPartition)
-        {
-            Match match = Regex.Match(
-                commandLine,
-                $@"\b{Regex.Escape(command)}\s+(?<partition>[^\s""']+)",
-                RegexOptions.IgnoreCase);
-            if (!match.Success)
-            {
-                return commandLine;
-            }
-
-            System.Text.RegularExpressions.Group partitionGroup = match.Groups["partition"];
-            return commandLine.Remove(partitionGroup.Index, partitionGroup.Length)
-                              .Insert(partitionGroup.Index, targetPartition);
-        }
-
-        private static bool IsCrcListPartition(string partitionName)
-        {
-            return partitionName.Equals("crclist", StringComparison.OrdinalIgnoreCase) ||
-                   partitionName.Equals("sparsecrclist", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private async Task<bool> DeviceRequiresCrcPartitionsAsync(
-            string fastbootPath,
-            CancellationToken cancellationToken)
-        {
-            string selectedSerial = GetSelectedDeviceSerial();
-            string arguments = string.IsNullOrWhiteSpace(selectedSerial)
-                ? "getvar crc"
-                : $"-s {selectedSerial} getvar crc";
-            string output = await GetCommandOutput(fastbootPath, arguments, cancellationToken);
-            return Regex.IsMatch(
-                output ?? string.Empty,
-                @"^\s*(?:\(bootloader\)\s*)?crc:\s*1\b",
-                RegexOptions.IgnoreCase | RegexOptions.Multiline);
-        }
-
-        private static PartitionInfo? FindPartitionSelectionForScript(
-            string scriptPartitionName,
-            IReadOnlyCollection<PartitionInfo> availablePartitions)
-        {
-            PartitionInfo? exactMatch = availablePartitions.FirstOrDefault(partition =>
-                partition.PartitionName.Equals(scriptPartitionName, StringComparison.OrdinalIgnoreCase));
-            if (exactMatch != null)
-            {
-                return exactMatch;
-            }
-
-            string normalizedName = scriptPartitionName;
-            if (scriptPartitionName.EndsWith("_a", StringComparison.OrdinalIgnoreCase) ||
-                scriptPartitionName.EndsWith("_b", StringComparison.OrdinalIgnoreCase))
-            {
-                normalizedName = scriptPartitionName.Substring(0, scriptPartitionName.Length - 2);
-                return availablePartitions.FirstOrDefault(partition =>
-                    partition.PartitionName.Equals($"{normalizedName}_ab", StringComparison.OrdinalIgnoreCase) ||
-                    partition.PartitionName.Equals(normalizedName, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (scriptPartitionName.EndsWith("_ab", StringComparison.OrdinalIgnoreCase))
-            {
-                normalizedName = scriptPartitionName.Substring(0, scriptPartitionName.Length - 3);
-                return availablePartitions.FirstOrDefault(partition =>
-                    partition.PartitionName.Equals(normalizedName, StringComparison.OrdinalIgnoreCase));
-            }
-
-            return availablePartitions.FirstOrDefault(partition =>
-                partition.PartitionName.Equals($"{scriptPartitionName}_ab", StringComparison.OrdinalIgnoreCase));
-        }
-
-        private async Task<bool> ExecutePostFlashCommands(
-            string fastbootPath,
-            System.Windows.Controls.RichTextBox logTextBox,
-            bool allowBootloaderLock = true,
-            bool allowScriptOnlyActions = true,
-            bool forceSwitchSlotA = false,
-            CancellationToken cancellationToken = default)
-        {
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (allowScriptOnlyActions && KeepUserDataCheckBox.IsChecked == true)
-                {
-                    LogToFastboot("[Erase] 开始清除数据...");
-                    
-                    // 执行 fastboot erase metadata
-                    if (!await ExecuteSingleFastbootCommand(
-                            fastbootPath,
-                            "erase metadata",
-                            logTextBox,
-                            cancellationToken: CancellationToken.None))
-                    {
-                        LogToFastboot("清除 metadata 失败，已停止后续操作", "Red");
-                        return false;
-                    }
-                    cancellationToken.ThrowIfCancellationRequested();
-                    
-                    // 执行 fastboot erase userdata
-                    if (!await ExecuteSingleFastbootCommand(
-                            fastbootPath,
-                            "erase userdata",
-                            logTextBox,
-                            cancellationToken: CancellationToken.None))
-                    {
-                        LogToFastboot("清除 userdata 失败，已停止后续操作", "Red");
-                        return false;
-                    }
-                    
-                    LogToFastboot("[Done] 数据清除完成...");
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
-                
-                // 2. 切换A槽
-                if (allowScriptOnlyActions &&
-                    (forceSwitchSlotA || SwitchSlotACheckBox.IsChecked == true))
-                {
-                    LogToFastboot("正在切换到A槽...");
-                    if (!await ExecuteSingleFastbootCommand(
-                            fastbootPath,
-                            "set_active a",
-                            logTextBox,
-                            showSuccessfulNativeOutput: true,
-                            cancellationToken: CancellationToken.None))
-                    {
-                        LogToFastboot("切换A槽失败，已停止后续操作", "Red");
-                        return false;
-                    }
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
-                
-                // 3. 锁定BL
-                if (allowScriptOnlyActions && LockBootloaderCheckBox.IsChecked == true)
-                {
-                    if (!allowBootloaderLock)
-                    {
-                        LogToFastboot("检测到分区刷写失败，为避免设备无法启动，已跳过锁定Bootloader", "Yellow");
-                    }
-                    else
-                    {
-                        LogToFastboot("[Lock] 锁定Bootloader...");
-                        if (!await ExecuteSingleFastbootCommand(
-                                fastbootPath,
-                                "oem lock",
-                                logTextBox,
-                                cancellationToken: CancellationToken.None))
-                        {
-                            LogToFastboot("锁定Bootloader失败，已停止后续操作", "Red");
-                            return false;
-                        }
-                        LogToFastboot("[Done] Bootloader已锁定");
-                    }
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
-                
-                // 4. 自动重启
-                if (RestartCheckBox.IsChecked == true)
-                {
-                    LogToFastboot("正在重启设备...");
-                    if (!await ExecuteSingleFastbootCommand(
-                            fastbootPath,
-                            "reboot",
-                            logTextBox,
-                            showSuccessfulNativeOutput: true,
-                            cancellationToken: CancellationToken.None))
-                    {
-                        LogToFastboot("设备重启命令发送失败", "Red");
-                        return false;
-                    }
-                }
-
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                LogToFastboot($"执行刷写后操作失败: {ex.Message}", "Red");
-                return false;
-            }
-        }
-        
-        private async Task<bool> ExecuteSingleFastbootCommand(
-            string fastbootPath,
-            string arguments,
-            System.Windows.Controls.RichTextBox logTextBox,
-            bool showSuccessfulNativeOutput = false,
-            CancellationToken cancellationToken = default)
-        {
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                string selectedSerial = GetSelectedDeviceSerial();
-                
-                // 如果有选中的设备序列号，添加 -s 参数
-                string finalArguments = arguments;
-                if (!string.IsNullOrEmpty(selectedSerial))
-                {
-                    finalArguments = $"-s {selectedSerial} {arguments}";
-                }
-                
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = fastbootPath,
-                    Arguments = finalArguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.GetDirectoryName(fastbootPath)
-                };
-                
-                using (Process process = new Process { StartInfo = startInfo })
-                {
-                    process.Start();
-
-                    Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-                    Task<string> errorTask = process.StandardError.ReadToEndAsync();
-                    try
-                    {
-                        await process.WaitForExitAsync(cancellationToken);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        try
-                        {
-                            if (!process.HasExited)
-                            {
-                                process.Kill(entireProcessTree: true);
-                            }
-                        }
-                        catch
-                        {
-                        }
-                        throw;
-                    }
-                    string output = await outputTask;
-                    string error = await errorTask;
-                    
-                    if (!string.IsNullOrWhiteSpace(output))
-                    {
-                        fastbootCompleteLog.AppendLine($"[{DateTime.Now:HH:mm:ss}] [FASTBOOT OUTPUT] {output.Trim()}");
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(error))
-                    {
-                        fastbootCompleteLog.AppendLine($"[{DateTime.Now:HH:mm:ss}] [FASTBOOT ERROR] {error.Trim()}");
-                    }
-
-                    if (process.ExitCode != 0)
-                    {
-                        string nativeError = string.Join(
-                            Environment.NewLine,
-                            new[] { error?.Trim(), output?.Trim() }
-                                .Where(text => !string.IsNullOrWhiteSpace(text)));
-                        if (!string.IsNullOrWhiteSpace(nativeError))
-                        {
-                            LogToFastboot(nativeError, "Red");
-                        }
-                        LogToFastboot($"fastboot 退出代码：{process.ExitCode}", "Red");
-                        return false;
-                    }
-
-                    if (showSuccessfulNativeOutput)
-                    {
-                        string nativeOutput = string.Join(
-                            Environment.NewLine,
-                            new[] { error?.Trim(), output?.Trim() }
-                                .Where(text => !string.IsNullOrWhiteSpace(text)));
-                        if (!string.IsNullOrWhiteSpace(nativeOutput))
-                        {
-                            LogToFastboot(nativeOutput, "Green");
-                        }
-                    }
-
-                    return true;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                LogToFastboot($"[错误] 执行fastboot命令失败: {ex.Message}", "Red");
-                return false;
-            }
-        }
-
-        private Task<bool> ExecuteFastbootCommandFromScript(
-            string commandLine,
-            string scriptPath,
-            string fastbootPath,
-            System.Windows.Controls.RichTextBox logTextBox,
-            string partitionName,
-            string? sourceFileName,
-            CancellationToken cancellationToken)
-        {
-            // 脚本刷写与手动分区刷写统一使用可视刷写日志处理器，
-            // 避免状态被写入 BasicFlash 的 FlashLogTextBox。
-            return ExecuteFastbootCommandFromScriptWithCustomLog(
-                commandLine,
-                scriptPath,
-                fastbootPath,
-                logTextBox,
-                partitionName,
-                sourceFileName,
-                trackDetailedPartitionStatus: false,
-                applyScriptVerificationOptions: true,
-                cancellationToken: cancellationToken);
-        }
-
-        private void LogToFastboot(string message, string color = "Black")
-        {
-            Dispatcher.Invoke(() =>
-            {
-                string normalizedMessage = Regex.Replace(message ?? string.Empty, @"^\[(Done|Flash|Prepare|Warning|Error)\]\s*", string.Empty, RegexOptions.IgnoreCase);
-                var paragraph = CreateFastbootLogParagraph();
-                AppendFastbootTimestamp(paragraph);
-                paragraph.Inlines.Add(new Run(normalizedMessage)
-                {
-                    Foreground = GetFastbootMessageBrush(color)
-                });
-                FastbootLogTextBox.Document.Blocks.Add(paragraph);
-                FastbootLogTextBox.ScrollToEnd();
-            });
-        }
-
-        private void LogToFastbootStyled(
-            params (string Text, string Color, bool Emphasized)[] segments)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                var paragraph = CreateFastbootLogParagraph();
-                AppendFastbootTimestamp(paragraph);
-                foreach ((string text, string color, bool emphasized) in segments)
-                {
-                    paragraph.Inlines.Add(new Run(text)
-                    {
-                        Foreground = GetFastbootMessageBrush(color),
-                        FontWeight = emphasized ? FontWeights.SemiBold : FontWeights.Normal
-                    });
-                }
-
-                FastbootLogTextBox.Document.Blocks.Add(paragraph);
-                FastbootLogTextBox.ScrollToEnd();
-            });
-        }
-
-        private void LogFastbootDeviceInfo(
-            string productName,
-            string unlockStatus,
-            string slot,
-            string mode)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                var labelBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(148, 163, 184));
-                var valueBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(100, 116, 139));
-
-                void AddDeviceInfoLine(string label, string value)
-                {
-                    var line = CreateFastbootLogParagraph();
-                    AppendFastbootTimestamp(line);
-                    line.Inlines.Add(new Run(label)
-                    {
-                        Foreground = labelBrush,
-                        FontWeight = FontWeights.SemiBold
-                    });
-                    line.Inlines.Add(new Run(string.IsNullOrWhiteSpace(value) ? "--" : value)
-                    {
-                        Foreground = valueBrush
-                    });
-                    FastbootLogTextBox.Document.Blocks.Add(line);
-                }
-
-                AddDeviceInfoLine("设备代号：", productName);
-                AddDeviceInfoLine("解锁状态：", unlockStatus);
-                AddDeviceInfoLine("当前槽位：", slot);
-                AddDeviceInfoLine("运行模式：", mode);
-                FastbootLogTextBox.ScrollToEnd();
-            });
-        }
-
-        private void LogFastbootNativeError(string nativeOutput, int exitCode)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                string[] errorLines = (nativeOutput ?? string.Empty)
-                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(line => line.Trim())
-                    .Where(line =>
-                        line.Contains("FAILED", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("error", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("remote:", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("cannot", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("denied", StringComparison.OrdinalIgnoreCase))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-
-                if (errorLines.Length == 0)
-                {
-                    errorLines = new[] { $"fastboot exited with code {exitCode}" };
-                }
-
-                foreach (string errorLine in errorLines)
-                {
-                    var paragraph = CreateFastbootLogParagraph();
-                    AppendFastbootTimestamp(paragraph);
-                    paragraph.Inlines.Add(new Run("[Fastboot] ")
-                    {
-                        Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 38, 38)),
-                        FontWeight = FontWeights.SemiBold
-                    });
-                    paragraph.Inlines.Add(new Run(errorLine)
-                    {
-                        Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 38, 38))
-                    });
-                    FastbootLogTextBox.Document.Blocks.Add(paragraph);
-                }
-
-                FastbootLogTextBox.ScrollToEnd();
-            });
-        }
-
-        private static Paragraph CreateFastbootLogParagraph()
-        {
-            return new Paragraph
-            {
-                Margin = new Thickness(0, 0.5, 0, 0.5),
-                LineHeight = 19
-            };
-        }
-
-        private static SolidColorBrush GetFastbootMessageBrush(string color)
-        {
-            return color.ToLowerInvariant() switch
-            {
-                "red" => new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 38, 38)),
-                "orange" or "yellow" => new SolidColorBrush(System.Windows.Media.Color.FromRgb(217, 119, 6)),
-                "green" => new SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 163, 74)),
-                "blue" => new SolidColorBrush(System.Windows.Media.Color.FromRgb(37, 99, 235)),
-                "purple" => new SolidColorBrush(System.Windows.Media.Color.FromRgb(124, 58, 237)),
-                _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(100, 116, 139))
-            };
-        }
-
-        private static void AppendFastbootTimestamp(Paragraph paragraph)
-        {
-            paragraph.Inlines.Add(new Run($"[{DateTime.Now:HH:mm:ss} ] ")
-            {
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(148, 163, 184))
-            });
-        }
-
-        private static string EnsureImgSuffix(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return "--";
-            }
-
-            return value.EndsWith(".img", StringComparison.OrdinalIgnoreCase) ? value : $"{value}.img";
-        }
-
-        private string GetFastbootWriteSourceDisplayName(string? sourceFileName, string partitionName)
-        {
-            string sourceDisplayName = !string.IsNullOrWhiteSpace(sourceFileName)
-                ? IOPath.GetFileName(sourceFileName)
-                : GetBasePartitionName(partitionName);
-
-            if (string.IsNullOrWhiteSpace(sourceDisplayName))
-            {
-                sourceDisplayName = "--";
-            }
-
-            return EnsureImgSuffix(sourceDisplayName);
-        }
-
-        private string BuildFastbootWriteStepTitle(string sourceDisplayName, string partitionName)
-        {
-            return $"{sourceDisplayName} → {EnsureImgSuffix(partitionName)}";
-        }
-
-        private static string BuildFastbootReadStepTitle(string partitionName)
-        {
-            return $"{EnsureImgSuffix(partitionName)} → 指定目录";
-        }
-
-        private static string BuildFastbootEraseStepTitle(string partitionName)
-        {
-            return partitionName;
-        }
-
-        private void BeginFastbootPendingStep(Dictionary<string, Paragraph> pendingParagraphs, string key, string title)
-        {
-            if (string.IsNullOrWhiteSpace(key))
-            {
-                key = title;
-            }
-
-            if (pendingParagraphs.ContainsKey(key))
-            {
-                return;
-            }
-
-            string operation = GetFastbootOperationLabel(pendingParagraphs, title);
-            var paragraph = CreateFastbootLogParagraph();
-            paragraph.Tag = (operation, title);
-            AppendFastbootTimestamp(paragraph);
-            paragraph.Inlines.Add(new Run($"[{operation}] ")
-            {
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(124, 58, 237)),
-                FontWeight = FontWeights.SemiBold
-            });
-            paragraph.Inlines.Add(new Run(title) { Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(51, 65, 85)) });
-            paragraph.Inlines.Add(new Run(" ...")
-            {
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(148, 163, 184))
-            });
-            FastbootLogTextBox.Document.Blocks.Add(paragraph);
-            FastbootLogTextBox.ScrollToEnd();
-            pendingParagraphs[key] = paragraph;
-        }
-
-        private void EndFastbootPendingStepOk(Dictionary<string, Paragraph> pendingParagraphs, string key, string fallbackTitle)
-        {
-            EndFastbootPendingStep(pendingParagraphs, key, fallbackTitle, true);
-        }
-
-        private void EndFastbootPendingStepError(Dictionary<string, Paragraph> pendingParagraphs, string key, string fallbackTitle)
-        {
-            EndFastbootPendingStep(pendingParagraphs, key, fallbackTitle, false);
-        }
-
-        private void EndFastbootPendingStep(Dictionary<string, Paragraph> pendingParagraphs, string key, string fallbackTitle, bool success)
-        {
-            if (string.IsNullOrWhiteSpace(key))
-            {
-                key = fallbackTitle;
-            }
-
-            if (pendingParagraphs.TryGetValue(key, out var paragraph))
-            {
-                var step = paragraph.Tag is ValueTuple<string, string> stepInfo
-                    ? stepInfo
-                    : (GetFastbootOperationLabel(pendingParagraphs, fallbackTitle), fallbackTitle);
-                RenderCompletedFastbootStep(paragraph, step.Item1, step.Item2, success);
-                FastbootLogTextBox.ScrollToEnd();
-                pendingParagraphs.Remove(key);
-                return;
-            }
-
-            var newParagraph = CreateFastbootLogParagraph();
-            RenderCompletedFastbootStep(newParagraph, GetFastbootOperationLabel(pendingParagraphs, fallbackTitle), fallbackTitle, success);
-            FastbootLogTextBox.Document.Blocks.Add(newParagraph);
-            FastbootLogTextBox.ScrollToEnd();
-        }
-
-        private string GetFastbootOperationLabel(Dictionary<string, Paragraph> pendingParagraphs, string title)
-        {
-            if (!ReferenceEquals(pendingParagraphs, _pendingFastbootReadParagraphs))
-            {
-                return "Flashing";
-            }
-
-            return title.Contains("指定目录", StringComparison.Ordinal) ||
-                   title.Contains("PC端", StringComparison.Ordinal) ||
-                   title.Contains("本地文件", StringComparison.Ordinal)
-                ? "Reading"
-                : "Erasing";
-        }
-
-        private static void RenderCompletedFastbootStep(Paragraph paragraph, string operation, string title, bool success)
-        {
-            paragraph.Inlines.Clear();
-            AppendFastbootTimestamp(paragraph);
-            paragraph.Inlines.Add(new Run($"[{operation}] ")
-            {
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(124, 58, 237)),
-                FontWeight = FontWeights.SemiBold
-            });
-            paragraph.Inlines.Add(new Run(title) { Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(51, 65, 85)) });
-            paragraph.Inlines.Add(new Run(success ? " ...OK" : " ...Error")
-            {
-                Foreground = new SolidColorBrush(success
-                    ? System.Windows.Media.Color.FromRgb(22, 163, 74)
-                    : System.Windows.Media.Color.FromRgb(220, 38, 38)),
-                FontWeight = FontWeights.Bold
-            });
-        }
-
-        private void CompleteFastbootPendingSteps(Dictionary<string, Paragraph> pendingParagraphs, bool success)
-        {
-            if (pendingParagraphs.Count <= 0)
-            {
-                return;
-            }
-
-            var pendingParagraphsSnapshot = pendingParagraphs.Values.ToArray();
-            foreach (var paragraph in pendingParagraphsSnapshot)
-            {
-                var step = paragraph.Tag is ValueTuple<string, string> stepInfo
-                    ? stepInfo
-                    : ("Flashing", "partition");
-                RenderCompletedFastbootStep(paragraph, step.Item1, step.Item2, success);
-            }
-
-            FastbootLogTextBox.ScrollToEnd();
-            pendingParagraphs.Clear();
-        }
-
-        private void LogFastbootWriteBegin(string? sourceFileName, string partitionName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                string sourceDisplayName = GetFastbootWriteSourceDisplayName(sourceFileName, partitionName);
-                BeginFastbootPendingStep(_pendingFastbootFlashParagraphs, partitionName, BuildFastbootWriteStepTitle(sourceDisplayName, partitionName));
-            });
-        }
-
-        private void LogFastbootWriteEndOk(string partitionName, string? sourceFileName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                string sourceDisplayName = GetFastbootWriteSourceDisplayName(sourceFileName, partitionName);
-                EndFastbootPendingStepOk(_pendingFastbootFlashParagraphs, partitionName, BuildFastbootWriteStepTitle(sourceDisplayName, partitionName));
-            });
-        }
-
-        private void LogFastbootWriteEndFail(string partitionName, string? sourceFileName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                string sourceDisplayName = GetFastbootWriteSourceDisplayName(sourceFileName, partitionName);
-                EndFastbootPendingStepError(_pendingFastbootFlashParagraphs, partitionName, BuildFastbootWriteStepTitle(sourceDisplayName, partitionName));
-            });
-        }
-
-        private void LogFastbootEraseBegin(string partitionName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                BeginFastbootPendingStep(_pendingFastbootReadParagraphs, partitionName, BuildFastbootEraseStepTitle(partitionName));
-            });
-        }
-
-        private void LogFastbootEraseEndOk(string partitionName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                EndFastbootPendingStepOk(_pendingFastbootReadParagraphs, partitionName, BuildFastbootEraseStepTitle(partitionName));
-            });
-        }
-
-        private void LogFastbootEraseEndFail(string partitionName)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                EndFastbootPendingStepError(_pendingFastbootReadParagraphs, partitionName, BuildFastbootEraseStepTitle(partitionName));
-            });
-        }
-
-        private void LogFastbootReadBegin(string partitionName)
-        {
-            if (string.IsNullOrWhiteSpace(partitionName)) partitionName = "--";
-            Dispatcher.Invoke(() =>
-            {
-                BeginFastbootPendingStep(_pendingFastbootReadParagraphs, partitionName, BuildFastbootReadStepTitle(partitionName));
-            });
-        }
-
-        private void LogFastbootReadEndOk(string partitionName)
-        {
-            if (string.IsNullOrWhiteSpace(partitionName)) partitionName = "--";
-            Dispatcher.Invoke(() =>
-            {
-                EndFastbootPendingStepOk(_pendingFastbootReadParagraphs, partitionName, BuildFastbootReadStepTitle(partitionName));
-            });
-        }
-
-        private void LogFastbootReadEndFail(string partitionName)
-        {
-            if (string.IsNullOrWhiteSpace(partitionName)) partitionName = "--";
-            Dispatcher.Invoke(() =>
-            {
-                EndFastbootPendingStepError(_pendingFastbootReadParagraphs, partitionName, BuildFastbootReadStepTitle(partitionName));
-            });
-        }
 
         private void DeviceDetectionToggle_Click(object sender, RoutedEventArgs e)
         {
@@ -20352,15 +8204,23 @@ public partial class MainWindow : Window
             }
         }
 
-        private void RefreshDeviceButton_Click(object sender, RoutedEventArgs e)
+        private async void RefreshDeviceButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                DeviceDetectionToggle.IsChecked = false;
-                HandleStopDeviceDetection();
-                DeviceDetectionToggle.IsChecked = true;
-                HandleStartDeviceDetection();
-                AddLogMessage("系统", "设备状态已刷新");
+                AddLogMessage("系统", "正在检测并刷新设备状态...");
+                if (DeviceStatusText != null)
+                {
+                    DeviceStatusText.Text = "检测中...";
+                }
+                if (DeviceDetectionToggle != null && DeviceDetectionToggle.IsChecked != true)
+                {
+                    DeviceDetectionToggle.IsChecked = true;
+                    HandleStartDeviceDetection();
+                }
+                await RefreshDeviceStatusImmediatelyAsync(terminateRunningTools: false);
+                await RefreshStorageMemoryAsync(silent: true);
+                AddLogMessage("系统", "设备状态与存储内存刷新完成");
             }
             catch (Exception ex)
             {
@@ -20432,213 +8292,6 @@ public partial class MainWindow : Window
             }
         }
 
-        private void LinkGuideTextBlock_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            try
-            {
-                // 使用默认浏览器打开指定链接
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = "https://violettool.top/",
-                    UseShellExecute = true
-                });
-                
-                // 添加日志消息
-                AddLogMessage("系统", "已打开链接指南页面");
-            }
-            catch (Exception ex)
-            {
-                System.Windows.MessageBox.Show($"打开链接时出错: {ex.Message}", "错误", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
-                AddLogMessage("错误", $"打开链接指南失败: {ex.Message}");
-            }
-        }
-    }
-
-    // 设备信息数据模型
-    public class DeviceInfo
-    {
-        public string Model { get; set; } = "";
-        public string Version { get; set; } = "";
-        public string Type { get; set; } = "";
-        public string? DownloadUrl { get; set; } // 匹配JSON中的DownloadUrl字段
-    }
-
-    // Autoroot功能辅助方法
-    public partial class MainWindow
-    {
-        private void InitializeAutorootPaths()
-        {
-            // 设置magiskboot.exe路径
-            string appDir = AppDomain.CurrentDomain.BaseDirectory;
-            magiskbootPath = IOPath.Combine(appDir, "magiskboot.exe");
-
-            // 创建临时目录
-            tempDir = IOPath.Combine(IOPath.GetTempPath(), "AutoRoot_" + Guid.NewGuid().ToString("N")[..8]);
-            Directory.CreateDirectory(tempDir);
-
-            // 检查magiskboot.exe是否存在
-            if (!IOFile.Exists(magiskbootPath))
-            {
-                AppendAutorootLog($"未找到magiskboot.exe文件: {magiskbootPath}");
-            }
-        }
-
-        private System.Windows.Documents.Paragraph? _autorootFastbootWaitParagraph;
-        private System.Windows.Documents.Run? _autorootFastbootWaitRun;
-
-        private void BeginAutorootFastbootWaitCountdown(int seconds)
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(() => BeginAutorootFastbootWaitCountdown(seconds));
-                return;
-            }
-
-            var richTextBox = this.FindName("txtLog") as System.Windows.Controls.RichTextBox;
-            if (richTextBox == null) return;
-            _autorootFastbootWaitParagraph = new System.Windows.Documents.Paragraph
-            {
-                Margin = new System.Windows.Thickness(0, 1, 0, 1),
-                LineHeight = 19
-            };
-            _autorootFastbootWaitParagraph.Inlines.Add(new System.Windows.Documents.Run($"{DateTime.Now:HH:mm:ss}")
-            {
-                Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(148, 163, 184)),
-                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
-                FontSize = 11
-            });
-            _autorootFastbootWaitParagraph.Inlines.Add(new System.Windows.Documents.Run("    "));
-            _autorootFastbootWaitRun = new System.Windows.Documents.Run
-            {
-                Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 41, 59))
-            };
-            _autorootFastbootWaitParagraph.Inlines.Add(_autorootFastbootWaitRun);
-            richTextBox.Document.Blocks.Add(_autorootFastbootWaitParagraph);
-            UpdateAutorootFastbootWaitCountdown(seconds);
-        }
-
-        private void UpdateAutorootFastbootWaitCountdown(int seconds)
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(() => UpdateAutorootFastbootWaitCountdown(seconds));
-                return;
-            }
-
-            if (_autorootFastbootWaitRun == null) return;
-            _autorootFastbootWaitRun.Text = $"等待Fastboot设备...{seconds}s （如果卡在这里请检查数据线或驱动）";
-            (this.FindName("txtLog") as System.Windows.Controls.RichTextBox)?.ScrollToEnd();
-        }
-
-        private void EndAutorootFastbootWaitCountdown()
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(EndAutorootFastbootWaitCountdown);
-                return;
-            }
-
-            _autorootFastbootWaitParagraph = null;
-            _autorootFastbootWaitRun = null;
-        }
-
-        private void AppendAutorootLog(string message, string color = "Black")
-        {
-            if (Dispatcher.CheckAccess())
-            {
-                var richTextBox = this.FindName("txtLog") as System.Windows.Controls.RichTextBox;
-                if (richTextBox != null)
-                {
-                    string normalized = color?.Trim().ToLowerInvariant() ?? "black";
-                    bool warningMessage = message.Contains("失败", StringComparison.OrdinalIgnoreCase) ||
-                                          message.Contains("无法", StringComparison.OrdinalIgnoreCase) ||
-                                          message.Contains("取消", StringComparison.OrdinalIgnoreCase) ||
-                                          message.Contains("仅支持", StringComparison.OrdinalIgnoreCase) ||
-                                          message.Contains("无可用", StringComparison.OrdinalIgnoreCase) ||
-                                          message.Contains("请手动", StringComparison.OrdinalIgnoreCase);
-                    System.Windows.Media.Brush messageBrush = normalized == "red"
-                        ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(185, 28, 28))
-                        : normalized == "yellow" && warningMessage
-                            ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(180, 83, 9))
-                            : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 41, 59));
-
-                    var paragraph = new System.Windows.Documents.Paragraph
-                    {
-                        Margin = new System.Windows.Thickness(0, 1, 0, 1),
-                        LineHeight = 19
-                    };
-                    paragraph.Inlines.Add(new System.Windows.Documents.Run($"{DateTime.Now:HH:mm:ss}")
-                    {
-                        Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(148, 163, 184)),
-                        FontFamily = new System.Windows.Media.FontFamily("Consolas"),
-                        FontSize = 11
-                    });
-                    paragraph.Inlines.Add(new System.Windows.Documents.Run("    "));
-
-                    int separator = message.IndexOf(':');
-                    if (separator < 0) separator = message.IndexOf('：');
-                    if (message.EndsWith("...OK", StringComparison.Ordinal))
-                    {
-                        paragraph.Inlines.Add(new System.Windows.Documents.Run(message[..^2])
-                        {
-                            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 41, 59))
-                        });
-                        paragraph.Inlines.Add(new System.Windows.Documents.Run("OK")
-                        {
-                            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(35, 155, 109)),
-                            FontWeight = FontWeights.SemiBold
-                        });
-                    }
-                    else if (separator > 0 && separator < 24)
-                    {
-                        paragraph.Inlines.Add(new System.Windows.Documents.Run(message[..(separator + 1)] + " ")
-                        {
-                            Foreground = messageBrush,
-                            FontWeight = FontWeights.SemiBold
-                        });
-                        paragraph.Inlines.Add(new System.Windows.Documents.Run(message[(separator + 1)..].TrimStart())
-                        {
-                            Foreground = messageBrush
-                        });
-                    }
-                    else
-                    {
-                        paragraph.Inlines.Add(new System.Windows.Documents.Run(message)
-                        {
-                            Foreground = messageBrush,
-                            FontWeight = normalized == "red" ? FontWeights.SemiBold : FontWeights.Normal
-                        });
-                    }
-
-                    richTextBox.Document.Blocks.Add(paragraph);
-                    richTextBox.ScrollToEnd();
-                }
-            }
-            else
-            {
-                Dispatcher.Invoke(() => AppendAutorootLog(message, color));
-            }
-        }
-
-        private void ConnectionGuideTextBlock_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = "https://violettool.top/tutorials/connect.html",
-                    UseShellExecute = true
-                });
-
-                AddLogMessage("系统", "已打开连接指南页面");
-            }
-            catch (Exception ex)
-            {
-                System.Windows.MessageBox.Show($"打开连接指南时出错: {ex.Message}", "错误", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
-                AddLogMessage("错误", $"打开连接指南失败: {ex.Message}");
-            }
-        }
-
         private void Usb3PatchTextBlock_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
             string batchPath = Path.Combine(
@@ -20685,500 +8338,6 @@ public partial class MainWindow : Window
             }
         }
 
-        private void AppendAutorootStage(string title, string detail = "")
-        {
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(() => AppendAutorootStage(title, detail));
-                return;
-            }
-
-            var richTextBox = this.FindName("txtLog") as System.Windows.Controls.RichTextBox;
-            if (richTextBox == null) return;
-            var paragraph = new System.Windows.Documents.Paragraph
-            {
-                Margin = new System.Windows.Thickness(0, 7, 0, 4),
-                Padding = new System.Windows.Thickness(9, 5, 9, 5),
-                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(244, 246, 248))
-            };
-            paragraph.Inlines.Add(new System.Windows.Documents.Run(title)
-            {
-                Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(71, 85, 105)),
-                FontWeight = FontWeights.SemiBold
-            });
-            if (!string.IsNullOrWhiteSpace(detail))
-            {
-                paragraph.Inlines.Add(new System.Windows.Documents.Run("    " + detail)
-                {
-                    Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(100, 116, 139)),
-                    FontSize = 11
-                });
-            }
-            richTextBox.Document.Blocks.Add(paragraph);
-            richTextBox.ScrollToEnd();
-        }
-
-        private async Task<bool> ExecuteMagiskPatchAsync(string bootPath, string outputPath, string magiskPath)
-        {
-            try
-            {
-                AppendAutorootLog("开始Magisk修补过程...");
-                AppendAutorootLog($"Boot文件: {bootPath}");
-                AppendAutorootLog($"输出路径: {outputPath}");
-                AppendAutorootLog($"Magisk包: {magiskPath}");
-
-                // 创建临时工作目录
-                string workDir = IOPath.Combine(tempDir, "magisk_work");
-                if (Directory.Exists(workDir))
-                {
-                    Directory.Delete(workDir, true);
-                }
-                Directory.CreateDirectory(workDir);
-                AppendAutorootLog($"创建工作目录: {workDir}");
-
-                // 步骤1: 从Magisk APK中提取必要文件
-                AppendAutorootLog("步骤1: 从Magisk APK中提取必要文件...");
-                if (!await ExtractMagiskFiles(magiskPath, workDir))
-                {
-                    AppendAutorootLog("提取Magisk文件失败");
-                    return false;
-                }
-
-                // 步骤2: 解包boot镜像
-                AppendAutorootLog("步骤2: 解包boot镜像...");
-                if (!await RunMagiskbootCommand($"unpack \"{bootPath}\"", workDir))
-                {
-                    AppendAutorootLog("解包boot镜像失败");
-                    return false;
-                }
-
-                // 检查ramdisk.cpio是否存在
-                string ramdiskPath = IOPath.Combine(workDir, "ramdisk.cpio");
-                if (!File.Exists(ramdiskPath))
-                {
-                    AppendAutorootLog("未找到ramdisk.cpio文件");
-                    return false;
-                }
-
-                // 步骤3: 测试ramdisk状态
-                AppendAutorootLog("步骤3: 测试ramdisk状态...");
-                await RunMagiskbootCommand($"cpio \"{ramdiskPath}\" test", workDir);
-
-                // 步骤4: 备份原始ramdisk
-                AppendAutorootLog("步骤4: 备份原始ramdisk...");
-                string ramdiskOrigPath = IOPath.Combine(workDir, "ramdisk.cpio.orig");
-                File.Copy(ramdiskPath, ramdiskOrigPath, true);
-
-                // 步骤5: 创建Magisk配置文件
-                AppendAutorootLog("步骤5: 创建Magisk配置文件...");
-                await CreateMagiskConfig(workDir, bootPath);
-
-                // 步骤6: 将Magisk文件添加到ramdisk
-                AppendAutorootLog("步骤6: 将Magisk文件添加到ramdisk...");
-                if (!await AddMagiskToRamdisk(workDir))
-                {
-                    AppendAutorootLog("添加Magisk文件到ramdisk失败");
-                    return false;
-                }
-
-                // 步骤7: 重新打包boot镜像
-                AppendAutorootLog("步骤7: 重新打包boot镜像...");
-                string repackArgs = $"repack \"{bootPath}\" \"{outputPath}\"";
-                
-                // 如果需要修补vbmeta标志
-                var repackEnvVars = new Dictionary<string, string>();
-                var chkPatchVbmeta = this.FindName("chkPatchVbmeta") as System.Windows.Controls.CheckBox;
-                if (chkPatchVbmeta?.IsChecked == true)
-                {
-                    repackEnvVars["PATCHVBMETAFLAG"] = "true";
-                    AppendAutorootLog("修补vbmeta标志");
-                }
-
-                if (!await RunMagiskbootCommandWithEnv(repackArgs, workDir, repackEnvVars))
-                {
-                    AppendAutorootLog("重新打包boot镜像失败");
-                    return false;
-                }
-
-                // 检查输出文件是否存在
-                if (File.Exists(outputPath))
-                {
-                    AppendAutorootLog("修补完成！", "green");
-                    AppendAutorootLog($"输出文件已保存到: {outputPath}");
-                    
-                    // 清理工作目录
-                    try
-                    {
-                        Directory.Delete(workDir, true);
-                        AppendAutorootLog("清理临时文件完成");
-                    }
-                    catch
-                    {
-                        AppendAutorootLog("清理临时文件时出现警告，但不影响修补结果");
-                    }
-                    
-                    return true;
-                }
-                else
-                {
-                    AppendAutorootLog("修补失败：输出文件未生成");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"修补过程中发生错误: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task<bool> ExtractMagiskFiles(string magiskPath, string workDir)
-        {
-            try
-            {
-                // 获取处理器架构
-                string arch = "arm64-v8a"; // 默认arm64
-                var cbArchitecture = this.FindName("cbArchitecture") as System.Windows.Controls.ComboBox;
-                if (cbArchitecture?.SelectedItem != null)
-                {
-                    string selectedArch = ((System.Windows.Controls.ComboBoxItem)cbArchitecture.SelectedItem).Content?.ToString() ?? "";
-                    switch (selectedArch)
-                    {
-                        case "arm_64": arch = "arm64-v8a"; break;
-                        case "arm_32": arch = "armeabi-v7a"; break;
-                        case "x86_64": arch = "x86_64"; break;
-                        case "x86_32": arch = "x86"; break;
-                        case "riscv_64": arch = "riscv64"; break;
-                    }
-                }
-
-                AppendAutorootLog($"目标架构: {arch}");
-
-                // 使用.NET的ZipFile类提取文件
-                using (var archive = System.IO.Compression.ZipFile.OpenRead(magiskPath))
-                {
-                    // 提取libmagiskinit.so
-                    var magiskInitEntry = archive.Entries.FirstOrDefault(e => e.FullName == $"lib/{arch}/libmagiskinit.so");
-                    if (magiskInitEntry != null)
-                    {
-                        string magiskInitPath = IOPath.Combine(workDir, "magiskinit");
-                        magiskInitEntry.ExtractToFile(magiskInitPath, true);
-                        AppendAutorootLog("提取magiskinit成功");
-                    }
-
-                    // 提取libmagisk.so
-                    var magiskEntry = archive.Entries.FirstOrDefault(e => e.FullName == $"lib/{arch}/libmagisk.so");
-                    if (magiskEntry != null)
-                    {
-                        string magiskPath_local = IOPath.Combine(workDir, "libmagisk.so");
-                        magiskEntry.ExtractToFile(magiskPath_local, true);
-                        AppendAutorootLog("提取libmagisk.so成功");
-                    }
-
-                    // 提取stub.apk
-                    var stubEntry = archive.Entries.FirstOrDefault(e => e.FullName == "assets/stub.apk");
-                    if (stubEntry != null)
-                    {
-                        string stubPath = IOPath.Combine(workDir, "stub.apk");
-                        stubEntry.ExtractToFile(stubPath, true);
-                        AppendAutorootLog("提取stub.apk成功");
-                    }
-
-                    // 提取libinit-ld.so
-                    var initLdEntry = archive.Entries.FirstOrDefault(e => e.FullName == $"lib/{arch}/libinit-ld.so");
-                    if (initLdEntry != null)
-                    {
-                        string initLdPath = IOPath.Combine(workDir, "libinit-ld.so");
-                        initLdEntry.ExtractToFile(initLdPath, true);
-                        AppendAutorootLog("提取libinit-ld.so成功");
-                    }
-                }
-
-                // 压缩文件为.xz格式
-                await CompressMagiskFiles(workDir);
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"提取Magisk文件时发生错误: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task CompressMagiskFiles(string workDir)
-        {
-            // 压缩libmagisk.so为magisk.xz
-            string libMagiskPath = IOPath.Combine(workDir, "libmagisk.so");
-            if (File.Exists(libMagiskPath))
-            {
-                await RunMagiskbootCommand($"compress=xz \"{libMagiskPath}\" \"{IOPath.Combine(workDir, "magisk.xz")}\"", workDir);
-                AppendAutorootLog("压缩magisk.xz成功");
-            }
-
-            // 压缩stub.apk为stub.xz
-            string stubPath = IOPath.Combine(workDir, "stub.apk");
-            if (File.Exists(stubPath))
-            {
-                await RunMagiskbootCommand($"compress=xz \"{stubPath}\" \"{IOPath.Combine(workDir, "stub.xz")}\"", workDir);
-                AppendAutorootLog("压缩stub.xz成功");
-            }
-
-            // 压缩libinit-ld.so为init-ld.xz
-            string libInitLdPath = IOPath.Combine(workDir, "libinit-ld.so");
-            if (File.Exists(libInitLdPath))
-            {
-                await RunMagiskbootCommand($"compress=xz \"{libInitLdPath}\" \"{IOPath.Combine(workDir, "init-ld.xz")}\"", workDir);
-                AppendAutorootLog("压缩init-ld.xz成功");
-            }
-        }
-
-        private async Task CreateMagiskConfig(string workDir, string bootPath)
-        {
-            try
-            {
-                string configPath = IOPath.Combine(workDir, "config");
-                var configLines = new List<string>();
-
-                var chkKeepVerity = this.FindName("chkKeepVerity") as System.Windows.Controls.CheckBox;
-                var chkKeepForceEncrypt = this.FindName("chkKeepForceEncrypt") as System.Windows.Controls.CheckBox;
-
-                // 添加配置选项
-                configLines.Add($"KEEPVERITY={chkKeepVerity?.IsChecked == true}");
-                configLines.Add($"KEEPFORCEENCRYPT={chkKeepForceEncrypt?.IsChecked == true}");
-                configLines.Add($"RECOVERYMODE=false"); // 默认false
-                
-                // 计算SHA1
-                string sha1 = await GetBootSha1(bootPath);
-                if (!string.IsNullOrEmpty(sha1))
-                {
-                    configLines.Add($"SHA1={sha1}");
-                }
-
-                await File.WriteAllLinesAsync(configPath, configLines);
-                AppendAutorootLog("创建Magisk配置文件成功");
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"创建配置文件时发生错误: {ex.Message}");
-            }
-        }
-
-        private async Task<string> GetBootSha1(string bootPath)
-        {
-            try
-            {
-                var result = await RunMagiskbootCommandWithOutput($"sha1 \"{bootPath}\"", IOPath.GetDirectoryName(bootPath) ?? "");
-                return result?.Trim() ?? "";
-            }
-            catch
-            {
-                return "";
-            }
-        }
-
-        private async Task<bool> AddMagiskToRamdisk(string workDir)
-        {
-            try
-            {
-                string ramdiskPath = IOPath.Combine(workDir, "ramdisk.cpio");
-                
-                // 检查必要文件是否存在
-                string magiskInitPath = IOPath.Combine(workDir, "magiskinit");
-                string magiskXzPath = IOPath.Combine(workDir, "magisk.xz");
-                string stubXzPath = IOPath.Combine(workDir, "stub.xz");
-                string initLdXzPath = IOPath.Combine(workDir, "init-ld.xz");
-                string configPath = IOPath.Combine(workDir, "config");
-
-                if (!File.Exists(magiskInitPath) || !File.Exists(magiskXzPath) || 
-                    !File.Exists(stubXzPath) || !File.Exists(initLdXzPath) || !File.Exists(configPath))
-                {
-                    AppendAutorootLog("缺少必要的Magisk文件");
-                    return false;
-                }
-
-                // 使用正确的Magisk修补命令 - 一次性执行所有操作
-                string patchCommand = $"cpio \"{ramdiskPath}\" " +
-                    $"\"add 0750 init magiskinit\" " +
-                    $"\"mkdir 0750 overlay.d\" " +
-                    $"\"mkdir 0750 overlay.d/sbin\" " +
-                    $"\"add 0644 overlay.d/sbin/magisk.xz magisk.xz\" " +
-                    $"\"add 0644 overlay.d/sbin/stub.xz stub.xz\" " +
-                    $"\"add 0644 overlay.d/sbin/init-ld.xz init-ld.xz\" " +
-                    $"\"patch\" " +
-                    $"\"backup ramdisk.cpio.orig\" " +
-                    $"\"mkdir 000 .backup\" " +
-                    $"\"add 000 .backup/.magisk config\"";
-
-                if (!await RunMagiskbootCommand(patchCommand, workDir))
-                {
-                    AppendAutorootLog("执行Magisk修补命令失败");
-                    return false;
-                }
-
-                AppendAutorootLog("添加Magisk文件到ramdisk成功");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"添加Magisk文件到ramdisk时发生错误: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task<bool> RunMagiskbootCommand(string arguments, string workingDirectory)
-        {
-            try
-            {
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = magiskbootPath,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = workingDirectory
-                };
-
-                using (Process? process = Process.Start(startInfo))
-                {
-                    if (process != null)
-                    {
-                        string output = await process.StandardOutput.ReadToEndAsync();
-                        string error = await process.StandardError.ReadToEndAsync();
-                        
-                        await process.WaitForExitAsync();
-                        
-                        if (!string.IsNullOrEmpty(output))
-                        {
-                            // 将输出信息记录为信息日志，不标记为错误
-                            AppendAutorootLog($"[信息] {output.Trim()}");
-                        }
-                        
-                        if (!string.IsNullOrEmpty(error))
-                        {
-                            // magiskboot的很多正常信息会输出到stderr，需要区分真正的错误
-                            // 只有在进程退出码不为0时才标记为错误
-                            if (process.ExitCode != 0)
-                            {
-                                AppendAutorootLog($"错误: {error.Trim()}");
-                            }
-                            else
-                            {
-                                // 正常的信息输出，不标记为错误
-                                AppendAutorootLog($"[信息] {error.Trim()}");
-                            }
-                        }
-                        
-                        return process.ExitCode == 0;
-                    }
-                }
-                return false;
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"执行magiskboot命令时发生错误: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task<bool> RunMagiskbootCommandWithEnv(string arguments, string workingDirectory, Dictionary<string, string> environmentVariables)
-        {
-            try
-            {
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = magiskbootPath,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = workingDirectory
-                };
-
-                foreach (var envVar in environmentVariables)
-                {
-                    startInfo.EnvironmentVariables[envVar.Key] = envVar.Value;
-                }
-
-                using (Process? process = Process.Start(startInfo))
-                {
-                    if (process != null)
-                    {
-                        string output = await process.StandardOutput.ReadToEndAsync();
-                        string error = await process.StandardError.ReadToEndAsync();
-                        
-                        await process.WaitForExitAsync();
-                        
-                        if (!string.IsNullOrEmpty(output))
-                        {
-                            // 将输出信息记录为信息日志，不标记为错误
-                            AppendAutorootLog($"[信息] {output.Trim()}");
-                        }
-                        
-                        if (!string.IsNullOrEmpty(error))
-                        {
-                            // magiskboot的很多正常信息会输出到stderr，需要区分真正的错误
-                            // 只有在进程退出码不为0时才标记为错误
-                            if (process.ExitCode != 0)
-                            {
-                                AppendAutorootLog($"错误: {error.Trim()}");
-                            }
-                            else
-                            {
-                                // 正常的信息输出，不标记为错误
-                                AppendAutorootLog($"[信息] {error.Trim()}");
-                            }
-                        }
-                        
-                        return process.ExitCode == 0;
-                    }
-                }
-                return false;
-            }
-            catch (Exception ex)
-            {
-                AppendAutorootLog($"执行magiskboot命令时发生错误: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task<string?> RunMagiskbootCommandWithOutput(string arguments, string workingDirectory)
-        {
-            try
-            {
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = magiskbootPath,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = workingDirectory
-                };
-
-                using (Process? process = Process.Start(startInfo))
-                {
-                    if (process != null)
-                    {
-                        string output = await process.StandardOutput.ReadToEndAsync();
-                        await process.WaitForExitAsync();
-                        
-                        return process.ExitCode == 0 ? output : null;
-                    }
-                }
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-        
-        // 处理开始检测设备功能
         private void HandleStartDeviceDetection()
         {
             try
@@ -21312,12 +8471,18 @@ public partial class MainWindow : Window
                     if (KernelVersionText != null) KernelVersionText.Text = "--";
                     if (BuildDateText != null) BuildDateText.Text = "--";
 
-                    if (BatteryControl != null)
+                    if (BatteryProgressBar != null)
                     {
-                        BatteryControl.Maximum = 100;
-                        BatteryControl.Value = 0;
-                        BatteryControl.IsCharging = false;
-                        BatteryControl.TemperatureText = "--";
+                        BatteryProgressBar.Maximum = 100;
+                        BatteryProgressBar.Value = 0;
+                    }
+                    if (BatteryValueText != null)
+                    {
+                        BatteryValueText.Text = "0%";
+                    }
+                    if (BatteryDetailText != null)
+                    {
+                        BatteryDetailText.Text = "--";
                     }
 
                     if (_storageViewModel != null)
@@ -21485,256 +8650,55 @@ public partial class MainWindow : Window
             }
         }
 
-        private void SelectSuperScatterButton_Click(object sender, RoutedEventArgs e)
+
+    }
+
+    public class DeviceInfo
+    {
+        public string Model { get; set; } = "";
+        public string Version { get; set; } = "";
+        public string Type { get; set; } = "";
+        public string? DownloadUrl { get; set; }
+    }
+
+    public sealed class XiaomiFlashProgressItem
+    {
+        public XiaomiFlashProgressItem(string partitionName, long length)
         {
-            var dialog = new System.Windows.Forms.FolderBrowserDialog();
-            dialog.Description = "请选择散包(Images)所在目录";
-            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-            {
-                if (SuperScatterPathTextBox != null)
-                {
-                    SuperScatterPathTextBox.Text = dialog.SelectedPath;
-                    AppendSuperLog($"已选择散包路径: {dialog.SelectedPath}");
-                }
-            }
+            PartitionName = partitionName;
+            Length = length;
         }
 
-        private async void StartSuperPackButton_Click(object sender, RoutedEventArgs e)
+        public string PartitionName { get; }
+        public long Length { get; }
+    }
+
+    public sealed class XiaomiFlashProgressState
+    {
+        public XiaomiFlashProgressState(IReadOnlyList<XiaomiFlashProgressItem> items)
         {
-            string dir = SuperScatterPathTextBox?.Text?.Trim() ?? "";
-            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
-            {
-                System.Windows.MessageBox.Show("请先选择有效的散包路径！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            StartSuperPackButton.IsEnabled = false;
-            AppendSuperLog("=== 开始构建 Super 镜像 ===");
-            
-            try
-            {
-                string binDir = AppDomain.CurrentDomain.BaseDirectory;
-                var maker = new SuperMaker(binDir, (msg) => Dispatcher.Invoke(() => AppendSuperLog(msg)));
-                
-                string outputDir = System.IO.Path.Combine(dir, "IMAGES");
-                if (!Directory.Exists(outputDir))
-                {
-                    Directory.CreateDirectory(outputDir);
-                }
-
-                bool success = await maker.MakeSuperFromDirectoryAsync(dir, outputDir);
-                
-                if (success)
-                {
-                    if (CleanupMyPartitionsCheckBox.IsChecked == true)
-                    {
-                        try
-                        {
-                            AppendSuperLog("=== 开始清理残留分区文件/文件夹 ===");
-                            var usedPartitions = maker.ProcessedPartitions; // 获取构建过程中用到的分区列表
-                            
-                            // 1. 清理文件夹
-                            var subDirs = Directory.GetDirectories(outputDir);
-                            foreach (var subDir in subDirs)
-                            {
-                                var dirName = new DirectoryInfo(subDir).Name;
-                                bool shouldDelete = false;
-
-                                // 规则1: my 开头
-                                if (dirName.StartsWith("my", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    shouldDelete = true;
-                                }
-                                // 规则2: 在 usedPartitions 列表中
-                                else if (usedPartitions.Contains(dirName, StringComparer.OrdinalIgnoreCase))
-                                {
-                                    shouldDelete = true;
-                                }
-
-                                if (shouldDelete)
-                                {
-                                    Directory.Delete(subDir, true);
-                                    AppendSuperLog($"已删除文件夹: {dirName}");
-                                }
-                            }
-
-                            // 2. 清理文件 (排除 super.img)
-                            var files = Directory.GetFiles(outputDir);
-                            foreach (var file in files)
-                            {
-                                var fileName = System.IO.Path.GetFileName(file);
-                                var fileNameNoExt = System.IO.Path.GetFileNameWithoutExtension(file);
-                                
-                                // 排除 super.img
-                                if (fileName.Equals("super.img", StringComparison.OrdinalIgnoreCase)) continue;
-
-                                bool shouldDelete = false;
-
-                                // 规则1: my 开头
-                                if (fileName.StartsWith("my", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    shouldDelete = true;
-                                }
-                                // 规则2: 在 usedPartitions 列表中
-                                else if (usedPartitions.Contains(fileNameNoExt, StringComparer.OrdinalIgnoreCase))
-                                {
-                                    shouldDelete = true;
-                                }
-
-                                if (shouldDelete)
-                                {
-                                    File.Delete(file);
-                                    AppendSuperLog($"已删除文件: {fileName}");
-                                }
-                            }
-
-                            AppendSuperLog("清理完成。");
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendSuperLog($"清理失败: {ex.Message}");
-                        }
-                    }
-
-                    if (FilterXmlCheckBox.IsChecked == true)
-                    {
-                        try
-                        {
-                            AppendSuperLog("=== 开始过滤多余 XML 文件 ===");
-                            string desktopDir = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                            string targetDir = System.IO.Path.Combine(desktopDir, "擦除与重构LUN");
-                            if (!Directory.Exists(targetDir))
-                            {
-                                Directory.CreateDirectory(targetDir);
-                            }
-
-                            var blankGptFiles = Directory.GetFiles(outputDir, "rawprogram*_BLANK_GPT.xml");
-                            var wipePartFiles = Directory.GetFiles(outputDir, "rawprogram*_WIPE_PARTITIONS.xml");
-                            var allFiles = blankGptFiles.Concat(wipePartFiles);
-
-                            foreach (var file in allFiles)
-                            {
-                                string fileName = System.IO.Path.GetFileName(file);
-                                string destPath = System.IO.Path.Combine(targetDir, fileName);
-                                if (File.Exists(destPath)) File.Delete(destPath);
-                                File.Move(file, destPath);
-                                AppendSuperLog($"已移动: {fileName}");
-                            }
-                            AppendSuperLog($"XML 过滤完成，文件已移动至: {targetDir}");
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendSuperLog($"XML 过滤失败: {ex.Message}");
-                        }
-                    }
-
-                    AppendSuperLog($"打包成功！输出路径: {outputDir}");
-                }
-                else
-                {
-                    System.Windows.MessageBox.Show("打包失败，请查看日志。", "失败", MessageBoxButton.OK, MessageBoxImage.Error);
-                    AppendSuperLog("打包失败！");
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendSuperLog($"[异常] {ex.Message}");
-                System.Windows.MessageBox.Show($"发生异常: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-            finally
-            {
-                StartSuperPackButton.IsEnabled = true;
-            }
+            Items = items;
+            TotalBytes = items.Sum(item => item.Length);
+            Elapsed = Stopwatch.StartNew();
         }
 
-        private void CleanupMyPartitionsCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-        }
+        public IReadOnlyList<XiaomiFlashProgressItem> Items { get; }
+        public long TotalBytes { get; }
+        public Stopwatch Elapsed { get; }
+        public int CurrentItemIndex { get; set; } = -1;
+        public long CompletedBytes { get; set; }
+        public long CurrentItemTransferredBytes { get; set; }
+        public long CompletedChunkBytes { get; set; }
+        public long CurrentChunkExpectedBytes { get; set; }
+        public long CurrentChunkReportedBytes { get; set; }
+        public long LastReportedBytes { get; set; }
+        public bool CurrentCommandFinished { get; set; }
+        public string TransferRate { get; set; } = "0MB/s";
+    }
 
-        private void AppendSuperLog(string msg)
-        {
-            if (SuperPackLogRichTextBox == null) return;
-            
-            Dispatcher.Invoke(() =>
-            {
-                var para = SuperPackLogRichTextBox.Document.Blocks.FirstBlock as Paragraph;
-                if (para == null)
-                {
-                    para = new Paragraph();
-                    SuperPackLogRichTextBox.Document.Blocks.Add(para);
-                }
-                
-                string text = msg;
-                System.Windows.Media.Brush? foreground = null;
-
-                if (text.StartsWith("COLOR:"))
-                {
-                    int pipeIndex = text.IndexOf('|');
-                    if (pipeIndex > 6)
-                    {
-                        string colorName = text.Substring(6, pipeIndex - 6);
-                        text = text.Substring(pipeIndex + 1);
-                        try
-                        {
-                            foreground = (System.Windows.Media.Brush?)new BrushConverter().ConvertFromString(colorName);
-                        }
-                        catch { }
-                    }
-                }
-
-                bool isAppend = text.Trim() == "OK";
-                if (isAppend)
-                {
-                    if (para.Inlines.LastInline is Run lastRun && lastRun.Text.EndsWith("\n"))
-                    {
-                        lastRun.Text = lastRun.Text.TrimEnd('\n');
-                    }
-                }
-
-                string content;
-                if (isAppend)
-                {
-                    content = $"{text}\n";
-                }
-                else
-                {
-                    string time = DateTime.Now.ToString("HH:mm:ss");
-                    content = $"[{time}] {text}\n";
-                }
-
-                var run = new Run(content);
-                if (foreground != null)
-                {
-                    run.Foreground = foreground;
-                    run.FontWeight = FontWeights.Bold;
-                }
-                para.Inlines.Add(run);
-                SuperPackLogRichTextBox.ScrollToEnd();
-            });
-        }
-
-        private async Task TryIncrementOpenCountAsync()
-        {
-            await Task.Run(() =>
-            {
-                try
-                {
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = "curl",
-                        Arguments = "-X POST https://violettool.top/web-api/open-count/increment -v",
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardOutput = false,
-                        RedirectStandardError = false
-                    };
-                    using var p = Process.Start(psi);
-                    p?.WaitForExit(3000);
-                }
-                catch
-                {
-                }
-            });
-        }
+    public enum XiaomiFlashMode
+    {
+        Traditional,
+        SlotA
     }
 }

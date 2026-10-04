@@ -13,6 +13,7 @@ namespace WpfApp1
         protected override void OnStartup(StartupEventArgs e)
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            GuardianService.InitializeGuardian();
             base.OnStartup(e);
         }
     }

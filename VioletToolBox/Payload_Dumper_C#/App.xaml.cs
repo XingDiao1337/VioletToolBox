@@ -258,7 +258,7 @@ namespace Payload_Dumper_C_
         private static string GetHelpText()
         {
             return
-                "usage: violet_payload.exe [-h] [--out OUT] [--diff] [--old OLD] [--partitions PARTITIONS] [--workers WORKERS] [--list] [--metadata] payloadfile\n\n" +
+                "usage: yuzaki_payload.exe [-h] [--out OUT] [--diff] [--old OLD] [--partitions PARTITIONS] [--workers WORKERS] [--list] [--metadata] payloadfile\n\n" +
                 "OTA payload dumper\n\n" +
                 "positional arguments:\n" +
                 "  payloadfile           payload file name (payload.bin / OTA ZIP / URL)\n\n" +
